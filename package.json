@@ -6,10 +6,15 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-		"test": "vitest"
+		"test": "vitest",
+		"test:upload": "node tools/upload-test.js",
+		"test:purge": "node tools/purge-test.js",
+		"test:delete": "node tools/delete-test.js"
 	},
+	"type": "module",
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"dotenv": "^16.5.0",
 		"vitest": "~3.0.7",
 		"wrangler": "^4.19.1"
 	}

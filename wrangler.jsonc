@@ -4,11 +4,28 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "r2-worker",
+	"name": "img-api-worker",
 	"main": "src/index.js",
 	"compatibility_date": "2025-06-05",
 	"observability": {
 		"enabled": true
+	},
+	"r2_buckets": [
+		{
+			"binding": "MEDIA_BUCKET",
+			"bucket_name": "media"
+		}
+	],
+	"routes": [
+		{
+			"pattern": "img.arroweffect.com/*",
+			"zone_name": "arroweffect.com"
+		}
+	],
+	"vars": {
+		"IMAGE_API_SECRET": "4321!",
+		"ZONE_ID": "bf918d304093f9d24490195f6a9860c3",
+		"CF_API_TOKEN": "ZA9r1kcPrBGgVsRR_cVudmLhd2THB1wvFkS9CPDM"
 	}
 	/**
 	 * Smart Placement
