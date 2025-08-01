@@ -90,7 +90,7 @@ async function handleDelete(request, env) {
 				success: false,
 				error: 'Unauthorized',
 			}),
-			{ status: 401, headers: { 'Content-Type': 'application/json' } }
+			{ status: 401, headers: { 'Content-Type': 'application/json' } },
 		);
 	}
 
@@ -103,7 +103,7 @@ async function handleDelete(request, env) {
 				success: false,
 				error: 'Invalid JSON body',
 			}),
-			{ status: 400, headers: { 'Content-Type': 'application/json' } }
+			{ status: 400, headers: { 'Content-Type': 'application/json' } },
 		);
 	}
 
@@ -115,7 +115,7 @@ async function handleDelete(request, env) {
 				success: false,
 				error: 'Missing `path` field in body',
 			}),
-			{ status: 400, headers: { 'Content-Type': 'application/json' } }
+			{ status: 400, headers: { 'Content-Type': 'application/json' } },
 		);
 	}
 
@@ -126,7 +126,7 @@ async function handleDelete(request, env) {
 				success: false,
 				error: `File "${path}" not found in bucket`,
 			}),
-			{ status: 404, headers: { 'Content-Type': 'application/json' } }
+			{ status: 404, headers: { 'Content-Type': 'application/json' } },
 		);
 	}
 
@@ -137,7 +137,7 @@ async function handleDelete(request, env) {
 			success: true,
 			deleted: path,
 		}),
-		{ status: 200, headers: { 'Content-Type': 'application/json' } }
+		{ status: 200, headers: { 'Content-Type': 'application/json' } },
 	);
 }
 
@@ -200,7 +200,7 @@ async function handlePurge(request, env) {
 		{
 			status: 200,
 			headers: { 'Content-Type': 'application/json' },
-		}
+		},
 	);
 }
 
@@ -215,6 +215,24 @@ async function handleFetchAndTransform(request) {
 	const searchParams = url.searchParams;
 
 	const imageURL = `https://media.arroweffect.com${path}`;
+
+	// If the file is SVG, just fetch it directly without transformations
+	if (imageURL.endsWith('.svg')) {
+		const res = await fetch(imageURL, {
+			headers: { Accept: 'image/svg+xml' },
+		});
+
+		if (!res.ok) {
+			return new Response('SVG not found', { status: res.status });
+		}
+
+		return new Response(await res.text(), {
+			headers: {
+				'Content-Type': 'image/svg+xml',
+				'Cache-Control': 'public, max-age=31536000',
+			},
+		});
+	}
 
 	const allowedParams = ['width', 'height', 'quality', 'fit', 'dpr', 'gravity', 'crop', 'pad', 'background', 'draw', 'rotate', 'trim'];
 	const imageOptions = {};
