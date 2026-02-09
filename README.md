@@ -229,4 +229,9 @@ GitHub Actions runs on push to `master` and on pull requests:
 1. **Test** — `pnpm test -- run`
 2. **Deploy** — `wrangler deploy` (only on push to `master`, after tests pass)
 
-The deploy step requires a `CLOUDFLARE_API_TOKEN` repository secret in GitHub with Workers Scripts (Edit) and Workers Routes (Edit) permissions.
+The deploy step requires two GitHub repository secrets:
+
+| Secret                   | Purpose                                                                 |
+| ------------------------ | ----------------------------------------------------------------------- |
+| `CLOUDFLARE_API_TOKEN`   | Cloudflare API token with Workers Scripts (Edit) and Workers Routes (Edit) permissions |
+| `CLOUDFLARE_ACCOUNT_ID`  | Cloudflare account ID                                                   |
