@@ -23,6 +23,20 @@ export default {
 };
 
 /**
+ * Validates that a storage path is safe to use with R2.
+ * Rejects empty paths, directory traversal, leading slashes, and control characters.
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isValidPath(path) {
+	if (!path || typeof path !== 'string') return false;
+	if (path.startsWith('/') || path.startsWith('.')) return false;
+	if (path.includes('..') || path.includes('//')) return false;
+	if (/[\x00-\x1f]/.test(path)) return false;
+	return true;
+}
+
+/**
  * Checks if the request is authorized via Bearer token.
  * @param {Request} request - Incoming HTTP request
  * @param {Record<string, any>} env - Worker environment bindings
@@ -63,6 +77,10 @@ async function handleUpload(request, env) {
 
 	if (!path || !contentType || !fileBase64) {
 		return new Response('Missing `path`, `contentType`, or `fileBase64` in body', { status: 400 });
+	}
+
+	if (!isValidPath(path)) {
+		return new Response('Invalid `path`', { status: 400 });
 	}
 
 	const buffer = Uint8Array.from(atob(fileBase64), (c) => c.charCodeAt(0));
@@ -119,7 +137,17 @@ async function handleDelete(request, env) {
 		);
 	}
 
-	const object = await env.MEDIA_BUCKET.get(path);
+	if (!isValidPath(path)) {
+		return new Response(
+			JSON.stringify({
+				success: false,
+				error: 'Invalid `path`',
+			}),
+			{ status: 400, headers: { 'Content-Type': 'application/json' } },
+		);
+	}
+
+	const object = await env.MEDIA_BUCKET.head(path);
 	if (!object) {
 		return new Response(
 			JSON.stringify({
@@ -213,70 +241,130 @@ async function handleFetchAndTransform(request) {
 	const url = new URL(request.url);
 	const path = url.pathname;
 	const searchParams = url.searchParams;
-
 	const imageURL = `https://media.arroweffect.com${path}`;
+	const isSvg = path.endsWith('.svg');
 
-	// If the file is SVG, just fetch it directly without transformations
-	if (imageURL.endsWith('.svg')) {
-		const res = await fetch(imageURL, {
-			headers: { Accept: 'image/svg+xml' },
-		});
+	// Step 1: Fetch the image (SVG = plain fetch, everything else = cf.image with fallback)
+	let response;
 
-		if (!res.ok) {
-			return new Response('SVG not found', { status: res.status });
+	if (isSvg) {
+		try {
+			response = await fetch(imageURL, { headers: { Accept: 'image/svg+xml' } });
+		} catch (err) {
+			console.error(`SVG fetch threw for ${imageURL}:`, err);
+			response = null;
+		}
+	} else {
+		const accept = request.headers.get('Accept') || '';
+		const allowedParams = ['width', 'height', 'quality', 'fit', 'dpr', 'gravity', 'crop', 'pad', 'background', 'draw', 'rotate', 'trim'];
+		const imageOptions = {};
+
+		for (const [key, value] of searchParams.entries()) {
+			if (allowedParams.includes(key)) {
+				const num = Number(value);
+				imageOptions[key] = isNaN(num) ? value : num;
+			}
 		}
 
-		return new Response(await res.text(), {
+		if (/image\/avif/.test(accept)) {
+			imageOptions.format = 'avif';
+		} else if (/image\/webp/.test(accept)) {
+			imageOptions.format = 'webp';
+		} else {
+			imageOptions.format = 'jpeg';
+		}
+
+		const imageRequest = new Request(imageURL, {
 			headers: {
-				'Content-Type': 'image/svg+xml',
-				'Cache-Control': 'public, max-age=31536000',
+				'User-Agent': 'Cloudflare-Worker',
+				Accept: accept || 'image/*',
 			},
 		});
-	}
 
-	const allowedParams = ['width', 'height', 'quality', 'fit', 'dpr', 'gravity', 'crop', 'pad', 'background', 'draw', 'rotate', 'trim'];
-	const imageOptions = {};
+		try {
+			response = await fetch(imageRequest, { cf: { image: imageOptions } });
+		} catch (err) {
+			console.error(`cf.image fetch threw for ${imageURL}:`, err);
+			response = null;
+		}
 
-	for (const [key, value] of searchParams.entries()) {
-		if (allowedParams.includes(key)) {
-			const num = Number(value);
-			imageOptions[key] = isNaN(num) ? value : num;
+		// Fallback: if transformation failed or returned a non-OK/non-404, fetch the original untransformed image
+		if (!response || (!response.ok && response.status !== 404)) {
+			if (response) {
+				console.error(`cf.image returned ${response.status} for ${imageURL}, falling back to origin`);
+			}
+			try {
+				response = await fetch(imageURL, {
+					headers: { 'User-Agent': 'Cloudflare-Worker', Accept: accept || 'image/*' },
+				});
+			} catch (err) {
+				console.error(`Origin fallback fetch threw for ${imageURL}:`, err);
+				response = null;
+			}
 		}
 	}
 
-	const accept = request.headers.get('Accept') || '';
-	if (/image\/avif/.test(accept)) {
-		imageOptions.format = 'avif';
-	} else if (/image\/webp/.test(accept)) {
-		imageOptions.format = 'webp';
-	} else if (/image\//.test(accept)) {
-		imageOptions.format = 'jpeg';
-	} else {
-		imageOptions.format = 'jpeg';
+	// Step 2: Shared error handling
+	if (!response) {
+		console.log(JSON.stringify({
+			level: 'error',
+			type: 'image_fetch_failed',
+			path: path,
+			origin: imageURL,
+			status: 502,
+			colo: request.cf?.colo,
+			country: request.cf?.country,
+			city: request.cf?.city,
+			ray: request.headers.get('cf-ray'),
+		}));
+		return new Response('Image fetch failed', {
+			status: 502,
+			headers: { 'Cache-Control': 'no-store' },
+		});
 	}
-
-	const options = { cf: { image: imageOptions } };
-
-	const imageRequest = new Request(imageURL, {
-		headers: {
-			'User-Agent': 'Cloudflare-Worker',
-			Accept: accept || 'image/*',
-		},
-	});
-
-	const response = await fetch(imageRequest, options);
 
 	if (response.status === 404) {
+		console.log(JSON.stringify({
+			level: 'error',
+			type: 'image_not_found',
+			path: path,
+			origin: imageURL,
+			status: 404,
+			colo: request.cf?.colo,
+			country: request.cf?.country,
+			city: request.cf?.city,
+			ray: request.headers.get('cf-ray'),
+		}));
 		return new Response('Image not found', {
 			status: 404,
-			headers: {
-				'Cache-Control': 'public, max-age=60',
-			},
+			headers: { 'Cache-Control': 'no-store' },
 		});
 	}
 
+	if (!response.ok) {
+		console.log(JSON.stringify({
+			level: 'error',
+			type: 'image_fetch_failed',
+			path: path,
+			origin: imageURL,
+			status: response.status,
+			colo: request.cf?.colo,
+			country: request.cf?.country,
+			city: request.cf?.city,
+			ray: request.headers.get('cf-ray'),
+		}));
+		return new Response('Image fetch failed', {
+			status: response.status,
+			headers: { 'Cache-Control': 'no-store' },
+		});
+	}
+
+	// Step 3: Success — cache and return
 	const headers = new Headers(response.headers);
 	headers.set('Cache-Control', 'public, max-age=31536000, stale-while-revalidate=86400');
+	if (isSvg) {
+		headers.set('Content-Type', 'image/svg+xml');
+	}
 
 	return new Response(response.body, {
 		headers,
