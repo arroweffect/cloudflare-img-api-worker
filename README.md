@@ -1,44 +1,41 @@
 # ArrowEffect Image API Worker
 
-This Cloudflare Worker provides an API for managing and serving images via Cloudflare R2 + Cloudflare Images.
+A Cloudflare Worker for managing and serving images via R2 storage and Cloudflare Image Transformations.
 
-It allows:
-✅ Uploading images to R2
-✅ Deleting images from R2
-✅ Purging cached images from Cloudflare CDN
-✅ Serving and transforming images on-the-fly
+- Upload, delete, and purge images via authenticated API endpoints
+- Serve and transform images on-the-fly (resize, format negotiation, quality)
+- SVG passthrough (served directly without transformation)
+- Automatic fallback to origin if image transformation fails
+- Error responses are never cached; only successful responses get long-lived cache headers
 
 ---
 
-## 🌟 **Endpoints**
+## Endpoints
 
 ### `POST /upload`
 
 Uploads a base64-encoded image to R2.
 
-#### Request headers:
+**Headers:**
 
 ```
 Authorization: Bearer <your-secret-token>
 Content-Type: application/json
 ```
 
-#### Request body:
+**Body:**
 
 ```json
 {
-	"path": "clients/example/cover.jpg",
-	"contentType": "image/jpeg",
-	"fileBase64": "<base64-encoded file>"
+  "path": "clients/example/cover.jpg",
+  "contentType": "image/jpeg",
+  "fileBase64": "<base64-encoded file>"
 }
 ```
 
-#### Success response:
+**Response:** `201 Created`
 
-```
-201 Created
-Uploaded clients/example/cover.jpg successfully
-```
+Path is validated — must not start with `/` or `.`, contain `..`, `//`, or control characters.
 
 ---
 
@@ -46,60 +43,60 @@ Uploaded clients/example/cover.jpg successfully
 
 Deletes an image from R2.
 
-#### Request headers:
+**Headers:**
 
 ```
 Authorization: Bearer <your-secret-token>
 Content-Type: application/json
 ```
 
-#### Request body:
+**Body:**
 
 ```json
 {
-	"path": "clients/example/cover.jpg"
+  "path": "clients/example/cover.jpg"
 }
 ```
 
-#### Success response:
+**Response:**
 
 ```json
 {
-	"success": true,
-	"deleted": "clients/example/cover.jpg"
+  "success": true,
+  "deleted": "clients/example/cover.jpg"
 }
 ```
+
+Returns 404 if the file does not exist. Path validation is the same as upload.
 
 ---
 
 ### `POST /purge`
 
-Purges the Cloudflare cache for a given image URL.
+Purges the Cloudflare CDN cache for a given image URL.
 
-#### Request headers:
+**Headers:**
 
 ```
 Authorization: Bearer <your-secret-token>
 Content-Type: application/json
 ```
 
-#### Request body:
+**Body:**
 
 ```json
 {
-	"url": "https://img.arroweffect.com/clients/example/cover.jpg"
+  "url": "https://img.arroweffect.com/clients/example/cover.jpg"
 }
 ```
 
-#### Success response:
+**Response:**
 
 ```json
 {
-	"success": true,
-	"purged": "https://img.arroweffect.com/clients/example/cover.jpg",
-	"cloudflare": {
-		/* Cloudflare API purge response */
-	}
+  "success": true,
+  "purged": "https://img.arroweffect.com/clients/example/cover.jpg",
+  "cloudflare": { ... }
 }
 ```
 
@@ -107,81 +104,129 @@ Content-Type: application/json
 
 ### `GET /*`
 
-Serves and transforms images on-the-fly.
+Serves and transforms images on-the-fly using [Cloudflare Image Transformations](https://developers.cloudflare.com/images/transform-images/).
 
-#### Example request:
+**Supported query parameters:** `width`, `height`, `quality`, `fit`, `dpr`, `gravity`, `crop`, `pad`, `background`, `draw`, `rotate`, `trim`
 
-```
-GET /clients/example/cover.jpg?width=800&format=webp
-```
+**Format negotiation:** Automatically selects avif, webp, or jpeg based on the `Accept` header.
 
-#### Example response:
-
-Returns transformed image with headers:
+**Example:**
 
 ```
-Cache-Control: public, max-age=31536000, stale-while-revalidate=86400
-Content-Type: image/webp
+GET /clients/example/cover.jpg?width=800&quality=80
 ```
+
+**Cache behavior:**
+- Successful responses: `Cache-Control: public, max-age=31536000, stale-while-revalidate=86400`
+- 404 and error responses: `Cache-Control: no-store`
+
+**Fallback:** If Cloudflare image transformation fails, the worker retries by fetching the original untransformed image from the origin.
+
+**SVGs:** Served directly without transformation.
 
 ---
 
-## 🔐 **Authentication**
+## Authentication
 
-All API routes require an `Authorization` header:
+The `POST` endpoints (`/upload`, `/delete`, `/purge`) require a Bearer token:
 
 ```
 Authorization: Bearer <your-secret-token>
 ```
 
-The secret token is configured via the `IMAGE_API_SECRET` environment variable.
+`GET` requests for serving images do not require authentication.
 
 ---
 
-## ⚙ **Environment variables**
+## Environment Variables
 
-| Variable           | Purpose                              |
-| ------------------ | ------------------------------------ |
-| `IMAGE_API_SECRET` | Secret token required for API access |
-| `CF_API_TOKEN`     | Token for Cloudflare cache purge API |
-| `ZONE_ID`          | Cloudflare Zone ID for the domain    |
-| `MEDIA_BUCKET`     | Bound R2 bucket for image storage    |
+| Variable           | Type    | Purpose                                          |
+| ------------------ | ------- | ------------------------------------------------ |
+| `IMAGE_API_SECRET` | Secret  | Bearer token for authenticating API requests     |
+| `CF_API_TOKEN`     | Secret  | Cloudflare API token for cache purge             |
+| `ZONE_ID`          | Secret  | Cloudflare Zone ID for the domain                |
+| `MEDIA_BUCKET`     | Binding | R2 bucket binding for image storage              |
+
+Secrets are set via `wrangler secret put <NAME>`. The R2 bucket is configured in `wrangler.jsonc`.
 
 ---
 
-## 💡 **Example usage**
+## Error Logging
 
-### Upload an image
+All error responses emit structured JSON logs with Cloudflare edge metadata:
 
-```bash
-curl -X POST https://img.arroweffect.com/upload   -H "Authorization: Bearer YOUR_TOKEN"   -H "Content-Type: application/json"   -d '{"path":"tests/test.jpg","contentType":"image/jpeg","fileBase64":"<encoded>"}'
+```json
+{
+  "level": "error",
+  "type": "image_not_found",
+  "path": "/example.jpg",
+  "origin": "https://media.arroweffect.com/example.jpg",
+  "status": 404,
+  "colo": "DFW",
+  "country": "US",
+  "city": "Dallas",
+  "ray": "..."
+}
 ```
 
-### Delete an image
-
-```bash
-curl -X POST https://img.arroweffect.com/delete   -H "Authorization: Bearer YOUR_TOKEN"   -H "Content-Type: application/json"   -d '{"path":"tests/test.jpg"}'
-```
-
-### Purge cache
-
-```bash
-curl -X POST https://img.arroweffect.com/purge   -H "Authorization: Bearer YOUR_TOKEN"   -H "Content-Type: application/json"   -d '{"url":"https://img.arroweffect.com/tests/test.jpg"}'
-```
+Filter by `type` in Cloudflare's observability dashboard:
+- `image_not_found` — 404s
+- `image_fetch_failed` — 502s and other upstream failures
 
 ---
 
-## 🚀 **Notes**
+## Development
 
-- Serving image requests (`GET`) does not require auth.
-- Uploads are cached for 1 year (`max-age=31536000`).
-- Deleted files will 404, but Cloudflare cached copies may still respond `HIT` until cache is purged.
-- Consider versioning file paths (e.g. `/v2/cover.jpg`) to avoid cache invalidation headaches.
+**Prerequisites:** Node.js 22+, pnpm
+
+```bash
+pnpm install
+pnpm dev          # Start local dev server via wrangler
+```
+
+Create a `.dev.vars` file for local secrets:
+
+```
+IMAGE_API_SECRET=your-local-secret
+```
+
+### Manual testing
+
+There are helper scripts in `tools/` for testing endpoints against the live worker:
+
+```bash
+pnpm test:upload   # Upload a test image
+pnpm test:purge    # Purge a test image from cache
+pnpm test:delete   # Delete a test image
+```
+
+These read `IMG_API_TOKEN` from `.env`.
 
 ---
 
-## 📌 **Future improvements**
+## Testing
 
-- Add OpenAPI spec
-- Support multipart upload for large files
-- Add cache tags for more flexible purging
+Tests use [Vitest](https://vitest.dev/) with [@cloudflare/vitest-pool-workers](https://developers.cloudflare.com/workers/testing/vitest-integration/) to run in the Workers runtime.
+
+```bash
+pnpm test         # Watch mode
+pnpm test -- run  # Single run
+```
+
+**Test coverage:**
+- `isValidPath` — path validation edge cases (traversal, control chars, etc.)
+- Routing — correct handler dispatch by method and path
+- Auth — missing, invalid, and malformed tokens
+- Upload/delete validation — path rejection, missing fields
+- Cache headers — errors return `no-store`, not long-lived cache
+
+---
+
+## CI/CD
+
+GitHub Actions runs on push to `master` and on pull requests:
+
+1. **Test** — `pnpm test -- run`
+2. **Deploy** — `wrangler deploy` (only on push to `master`, after tests pass)
+
+The deploy step requires a `CLOUDFLARE_API_TOKEN` repository secret in GitHub with Workers Scripts (Edit) and Workers Routes (Edit) permissions.
