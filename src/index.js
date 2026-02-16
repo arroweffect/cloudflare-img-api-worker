@@ -266,12 +266,20 @@ async function handleFetchAndTransform(request) {
 			}
 		}
 
-		if (/image\/avif/.test(accept)) {
-			imageOptions.format = 'avif';
-		} else if (/image\/webp/.test(accept)) {
-			imageOptions.format = 'webp';
+		const urlFormat = searchParams.get('format');
+
+		if (urlFormat && urlFormat !== 'auto') {
+			// Explicit format requested (e.g., 'png', 'webp', 'avif') — use as-is
+			imageOptions.format = urlFormat;
 		} else {
-			imageOptions.format = 'jpeg';
+			// No format or format=auto — content-negotiate from Accept header
+			if (/image\/avif/.test(accept)) {
+				imageOptions.format = 'avif';
+			} else if (/image\/webp/.test(accept)) {
+				imageOptions.format = 'webp';
+			} else {
+				imageOptions.format = 'jpeg';
+			}
 		}
 
 		const imageRequest = new Request(imageURL, {

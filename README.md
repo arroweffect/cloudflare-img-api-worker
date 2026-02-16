@@ -106,9 +106,9 @@ Content-Type: application/json
 
 Serves and transforms images on-the-fly using [Cloudflare Image Transformations](https://developers.cloudflare.com/images/transform-images/).
 
-**Supported query parameters:** `width`, `height`, `quality`, `fit`, `dpr`, `gravity`, `crop`, `pad`, `background`, `draw`, `rotate`, `trim`
+**Supported query parameters:** `width`, `height`, `quality`, `fit`, `dpr`, `gravity`, `crop`, `pad`, `background`, `draw`, `rotate`, `trim`, `format`
 
-**Format negotiation:** Automatically selects avif, webp, or jpeg based on the `Accept` header.
+**Format negotiation:** Automatically selects avif, webp, or jpeg based on the `Accept` header. Pass `format=png` (or `webp`, `avif`, etc.) to override. `format=auto` uses content negotiation (the default).
 
 **Example:**
 
