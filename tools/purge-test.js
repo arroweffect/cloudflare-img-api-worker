@@ -1,20 +1,26 @@
 import 'dotenv/config';
 
-const API_URL = 'https://img.arroweffect.com/purge';
-const TOKEN = process.env.IMG_API_TOKEN;
-const TARGET_URL = 'https://img.arroweffect.com/tests/test-image.jpg';
+const API_BASE = process.env.IMG_API_BASE;
+const SECRET = process.env.IMG_API_SECRET;
 
-if (!TOKEN) {
-	console.error('❌ IMG_API_TOKEN is missing. Check your .env file.');
+if (!API_BASE) {
+	console.error('❌ IMG_API_BASE is missing. Check your .env file.');
 	process.exit(1);
 }
+if (!SECRET) {
+	console.error('❌ IMG_API_SECRET is missing. Check your .env file.');
+	process.exit(1);
+}
+
+const API_URL = `${API_BASE}/purge`;
+const TARGET_URL = `${API_BASE}/tests/test-image.jpg`;
 
 (async () => {
 	try {
 		const res = await fetch(API_URL, {
 			method: 'POST',
 			headers: {
-				Authorization: `Bearer ${TOKEN}`,
+				Authorization: `Bearer ${SECRET}`,
 				'Content-Type': 'application/json',
 			},
 			body: JSON.stringify({

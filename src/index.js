@@ -17,7 +17,7 @@ export default {
 		} else if (pathname === '/delete' && method === 'POST') {
 			return handleDelete(request, env);
 		} else {
-			return handleFetchAndTransform(request);
+			return handleFetchAndTransform(request, env);
 		}
 	},
 };
@@ -48,7 +48,7 @@ function isAuthorized(request, env) {
 		return false;
 	}
 	const token = authHeader.substring(7);
-	return token === env.IMAGE_API_SECRET;
+	return token === env.IMG_API_SECRET;
 }
 
 /**
@@ -204,7 +204,7 @@ async function handlePurge(request, env) {
 	const purgeRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${env.ZONE_ID}/purge_cache`, {
 		method: 'POST',
 		headers: {
-			Authorization: `Bearer ${env.CF_API_TOKEN}`,
+			Authorization: `Bearer ${env.CF_PURGE_TOKEN}`,
 			'Content-Type': 'application/json',
 		},
 		body: JSON.stringify({
@@ -235,13 +235,14 @@ async function handlePurge(request, env) {
 /**
  * Handles serving and transforming images using Cloudflare Images API.
  * @param {Request} request - Incoming HTTP request
+ * @param {Record<string, any>} env - Worker environment bindings
  * @returns {Promise<Response>}
  */
-async function handleFetchAndTransform(request) {
+async function handleFetchAndTransform(request, env) {
 	const url = new URL(request.url);
 	const path = url.pathname;
 	const searchParams = url.searchParams;
-	const imageURL = `https://media.arroweffect.com${path}`;
+	const imageURL = `${env.CDN_ORIGIN}${path}`;
 	const isSvg = path.endsWith('.svg');
 
 	// Step 1: Fetch the image (SVG = plain fetch, everything else = cf.image with fallback)
@@ -314,17 +315,19 @@ async function handleFetchAndTransform(request) {
 
 	// Step 2: Shared error handling
 	if (!response) {
-		console.log(JSON.stringify({
-			level: 'error',
-			type: 'image_fetch_failed',
-			path: path,
-			origin: imageURL,
-			status: 502,
-			colo: request.cf?.colo,
-			country: request.cf?.country,
-			city: request.cf?.city,
-			ray: request.headers.get('cf-ray'),
-		}));
+		console.log(
+			JSON.stringify({
+				level: 'error',
+				type: 'image_fetch_failed',
+				path: path,
+				origin: imageURL,
+				status: 502,
+				colo: request.cf?.colo,
+				country: request.cf?.country,
+				city: request.cf?.city,
+				ray: request.headers.get('cf-ray'),
+			}),
+		);
 		return new Response('Image fetch failed', {
 			status: 502,
 			headers: { 'Cache-Control': 'no-store' },
@@ -332,17 +335,19 @@ async function handleFetchAndTransform(request) {
 	}
 
 	if (response.status === 404) {
-		console.log(JSON.stringify({
-			level: 'error',
-			type: 'image_not_found',
-			path: path,
-			origin: imageURL,
-			status: 404,
-			colo: request.cf?.colo,
-			country: request.cf?.country,
-			city: request.cf?.city,
-			ray: request.headers.get('cf-ray'),
-		}));
+		console.log(
+			JSON.stringify({
+				level: 'error',
+				type: 'image_not_found',
+				path: path,
+				origin: imageURL,
+				status: 404,
+				colo: request.cf?.colo,
+				country: request.cf?.country,
+				city: request.cf?.city,
+				ray: request.headers.get('cf-ray'),
+			}),
+		);
 		return new Response('Image not found', {
 			status: 404,
 			headers: { 'Cache-Control': 'no-store' },
@@ -350,17 +355,19 @@ async function handleFetchAndTransform(request) {
 	}
 
 	if (!response.ok) {
-		console.log(JSON.stringify({
-			level: 'error',
-			type: 'image_fetch_failed',
-			path: path,
-			origin: imageURL,
-			status: response.status,
-			colo: request.cf?.colo,
-			country: request.cf?.country,
-			city: request.cf?.city,
-			ray: request.headers.get('cf-ray'),
-		}));
+		console.log(
+			JSON.stringify({
+				level: 'error',
+				type: 'image_fetch_failed',
+				path: path,
+				origin: imageURL,
+				status: response.status,
+				colo: request.cf?.colo,
+				country: request.cf?.country,
+				city: request.cf?.city,
+				ray: request.headers.get('cf-ray'),
+			}),
+		);
 		return new Response('Image fetch failed', {
 			status: response.status,
 			headers: { 'Cache-Control': 'no-store' },

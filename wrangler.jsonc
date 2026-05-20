@@ -21,6 +21,10 @@
 			"pattern": "img.arroweffect.com/*",
 			"zone_name": "arroweffect.com",
 		},
+		{
+			"pattern": "img.afxengine.com/*",
+			"zone_name": "afxengine.com",
+		},
 	],
 	/**
 	 * Smart Placement
@@ -39,7 +43,7 @@
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
-	"vars": { "IMAGE_API_SECRET": "test-secret" },
+	"vars": { "CDN_ORIGIN": "https://cdn.afxengine.com" },
 	// "vars": { "MY_VARIABLE": "production_value" },
 	/**
 	 * Note: Use secrets to store sensitive data.

@@ -1,6 +1,9 @@
-# ArrowEffect Image API Worker
+# AFX Engine Image API Worker
 
 A Cloudflare Worker for managing and serving images via R2 storage and Cloudflare Image Transformations.
+
+**Public hostname:** `img.afxengine.com`.
+**Image origin (R2 custom domain):** `cdn.afxengine.com`.
 
 - Upload, delete, and purge images via authenticated API endpoints
 - Serve and transform images on-the-fly (resize, format negotiation, quality)
@@ -27,9 +30,9 @@ Content-Type: application/json
 
 ```json
 {
-  "path": "clients/example/cover.jpg",
-  "contentType": "image/jpeg",
-  "fileBase64": "<base64-encoded file>"
+	"path": "clients/example/cover.jpg",
+	"contentType": "image/jpeg",
+	"fileBase64": "<base64-encoded file>"
 }
 ```
 
@@ -54,7 +57,7 @@ Content-Type: application/json
 
 ```json
 {
-  "path": "clients/example/cover.jpg"
+	"path": "clients/example/cover.jpg"
 }
 ```
 
@@ -62,8 +65,8 @@ Content-Type: application/json
 
 ```json
 {
-  "success": true,
-  "deleted": "clients/example/cover.jpg"
+	"success": true,
+	"deleted": "clients/example/cover.jpg"
 }
 ```
 
@@ -86,7 +89,7 @@ Content-Type: application/json
 
 ```json
 {
-  "url": "https://img.arroweffect.com/clients/example/cover.jpg"
+	"url": "https://img.afxengine.com/clients/example/cover.jpg"
 }
 ```
 
@@ -95,7 +98,7 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "purged": "https://img.arroweffect.com/clients/example/cover.jpg",
+  "purged": "https://img.afxengine.com/clients/example/cover.jpg",
   "cloudflare": { ... }
 }
 ```
@@ -117,6 +120,7 @@ GET /clients/example/cover.jpg?width=800&quality=80
 ```
 
 **Cache behavior:**
+
 - Successful responses: `Cache-Control: public, max-age=31536000, stale-while-revalidate=86400`
 - 404 and error responses: `Cache-Control: no-store`
 
@@ -128,26 +132,32 @@ GET /clients/example/cover.jpg?width=800&quality=80
 
 ## Authentication
 
-The `POST` endpoints (`/upload`, `/delete`, `/purge`) require a Bearer token:
+There are two distinct tokens involved, with different roles:
+
+- **`IMG_API_SECRET`** — gates inbound requests to this worker. Callers must send it as a Bearer token on `POST /upload`, `/delete`, and `/purge`. `GET` requests for serving images do not require auth.
+- **`CF_PURGE_TOKEN`** — used outbound, only by `/purge`, to authenticate the worker to Cloudflare's REST API when calling `/zones/:zone_id/purge_cache`. Mint it as a Cloudflare API token scoped to **Zone → Cache Purge** on the relevant zone.
+
+Uploads and deletes do **not** need a Cloudflare API token — they use the R2 binding (`MEDIA_BUCKET`), which is authenticated implicitly by the worker's deployment identity.
+
+Inbound bearer header for the protected endpoints:
 
 ```
-Authorization: Bearer <your-secret-token>
+Authorization: Bearer <IMG_API_SECRET>
 ```
-
-`GET` requests for serving images do not require authentication.
 
 ---
 
 ## Environment Variables
 
-| Variable           | Type    | Purpose                                          |
-| ------------------ | ------- | ------------------------------------------------ |
-| `IMAGE_API_SECRET` | Secret  | Bearer token for authenticating API requests     |
-| `CF_API_TOKEN`     | Secret  | Cloudflare API token for cache purge             |
-| `ZONE_ID`          | Secret  | Cloudflare Zone ID for the domain                |
-| `MEDIA_BUCKET`     | Binding | R2 bucket binding for image storage              |
+| Variable         | Type    | Purpose                                                                                  |
+| ---------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `IMG_API_SECRET` | Secret  | Bearer token callers send to authenticate against `/upload`, `/delete`, `/purge`         |
+| `CF_PURGE_TOKEN` | Secret  | Cloudflare API token (Zone → Cache Purge) used by `/purge` to call the Cloudflare API    |
+| `ZONE_ID`        | Secret  | Cloudflare Zone ID the purge call targets                                                |
+| `CDN_ORIGIN`     | Var     | Base URL the worker fetches images from (R2 custom domain)                               |
+| `MEDIA_BUCKET`   | Binding | R2 bucket binding — used for upload/delete; no separate token needed                     |
 
-Secrets are set via `wrangler secret put <NAME>`. The R2 bucket is configured in `wrangler.jsonc`.
+Secrets are set via `wrangler secret put <NAME>`. Plain vars and the R2 bucket binding are declared in `wrangler.jsonc`.
 
 ---
 
@@ -157,19 +167,20 @@ All error responses emit structured JSON logs with Cloudflare edge metadata:
 
 ```json
 {
-  "level": "error",
-  "type": "image_not_found",
-  "path": "/example.jpg",
-  "origin": "https://media.arroweffect.com/example.jpg",
-  "status": 404,
-  "colo": "DFW",
-  "country": "US",
-  "city": "Dallas",
-  "ray": "..."
+	"level": "error",
+	"type": "image_not_found",
+	"path": "/example.jpg",
+	"origin": "https://cdn.afxengine.com/example.jpg",
+	"status": 404,
+	"colo": "DFW",
+	"country": "US",
+	"city": "Dallas",
+	"ray": "..."
 }
 ```
 
 Filter by `type` in Cloudflare's observability dashboard:
+
 - `image_not_found` — 404s
 - `image_fetch_failed` — 502s and other upstream failures
 
@@ -184,15 +195,15 @@ pnpm install
 pnpm dev          # Start local dev server via wrangler
 ```
 
-Create a `.dev.vars` file for local secrets:
+Create a `.dev.vars` file (gitignored) with your local worker secrets — see `.dev.vars.example`:
 
 ```
-IMAGE_API_SECRET=your-local-secret
+IMG_API_SECRET="your-local-secret"
 ```
 
 ### Manual testing
 
-There are helper scripts in `tools/` for testing endpoints against the live worker:
+There are helper scripts in `tools/` for testing endpoints against a deployed worker (or your local `wrangler dev`):
 
 ```bash
 pnpm test:upload   # Upload a test image
@@ -200,7 +211,7 @@ pnpm test:purge    # Purge a test image from cache
 pnpm test:delete   # Delete a test image
 ```
 
-These read `IMG_API_TOKEN` from `.env`.
+These read `IMG_API_SECRET` and `IMG_API_BASE` from `.env` — see `.env.example`. `IMG_API_SECRET` must match whatever value the target worker has configured (production secret, or your `.dev.vars` value when pointing at `wrangler dev`).
 
 ---
 
@@ -214,6 +225,7 @@ pnpm test -- run  # Single run
 ```
 
 **Test coverage:**
+
 - `isValidPath` — path validation edge cases (traversal, control chars, etc.)
 - Routing — correct handler dispatch by method and path
 - Auth — missing, invalid, and malformed tokens
@@ -231,7 +243,7 @@ GitHub Actions runs on push to `master` and on pull requests:
 
 The deploy step requires two GitHub repository secrets:
 
-| Secret                   | Purpose                                                                 |
-| ------------------------ | ----------------------------------------------------------------------- |
-| `CLOUDFLARE_API_TOKEN`   | Cloudflare API token with Workers Scripts (Edit) and Workers Routes (Edit) permissions |
-| `CLOUDFLARE_ACCOUNT_ID`  | Cloudflare account ID                                                   |
+| Secret                  | Purpose                                                                                |
+| ----------------------- | -------------------------------------------------------------------------------------- |
+| `CLOUDFLARE_API_TOKEN`  | Cloudflare API token with Workers Scripts (Edit) and Workers Routes (Edit) permissions |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID                                                                  |

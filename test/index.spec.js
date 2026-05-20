@@ -110,7 +110,7 @@ describe('auth', () => {
 describe('upload validation', () => {
 	function authHeaders() {
 		return {
-			Authorization: `Bearer ${env.IMAGE_API_SECRET}`,
+			Authorization: `Bearer ${env.IMG_API_SECRET}`,
 			'Content-Type': 'application/json',
 		};
 	}
@@ -144,7 +144,7 @@ describe('upload validation', () => {
 describe('delete validation', () => {
 	function authHeaders() {
 		return {
-			Authorization: `Bearer ${env.IMAGE_API_SECRET}`,
+			Authorization: `Bearer ${env.IMG_API_SECRET}`,
 			'Content-Type': 'application/json',
 		};
 	}
