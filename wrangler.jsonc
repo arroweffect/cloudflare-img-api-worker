@@ -15,6 +15,11 @@
 			"binding": "MEDIA_BUCKET",
 			"bucket_name": "media",
 		},
+		{
+			// Keys whose first segment ends in -staging, -preview or -sandbox (src/index.js isStagingKey).
+			"binding": "MEDIA_STAGING_BUCKET",
+			"bucket_name": "media-staging",
+		},
 	],
 	"routes": [
 		{
@@ -43,7 +48,8 @@
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
-	"vars": { "CDN_ORIGIN": "https://cdn.afxengine.com" },
+	// The custom domains of `media` and `media-staging`.
+	"vars": { "CDN_ORIGIN": "https://cdn.afxengine.com", "CDN_STAGING_ORIGIN": "https://cdn-staging.afxengine.com" },
 	// "vars": { "MY_VARIABLE": "production_value" },
 	/**
 	 * Note: Use secrets to store sensitive data.

@@ -1,6 +1,6 @@
-import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
-import worker, { isValidPath } from '../src';
+import { env, createExecutionContext, fetchMock, waitOnExecutionContext } from 'cloudflare:test';
+import { afterAll, afterEach, beforeAll, describe, it, expect } from 'vitest';
+import worker, { isStagingKey, isValidPath } from '../src';
 
 // Helper to call worker.fetch with a context
 async function workerFetch(request, workerEnv = env) {
@@ -184,5 +184,123 @@ describe('cache headers', () => {
 		const request = new Request('http://example.com/nonexistent.svg');
 		const response = await workerFetch(request);
 		expect(response.headers.get('Cache-Control')).toBe('no-store');
+	});
+});
+
+describe('bucket routing by tier', () => {
+	it.each([
+		['afx-site-staging/acme/media_01j8/logo.png', 'afx staging'],
+		['afx-site-preview/acme/media_01j8/logo.png', 'afx preview and local dev'],
+		['afx-site-sandbox/acme/logo.png', 'afx sandbox'],
+		['jhb-site-staging/acme/logo.png', 'jhb staging'],
+		['jhb-site-preview/acme/logo.png', 'jhb preview'],
+		['/afx-site-staging/acme/logo.png', 'a request path'],
+	])('reads %s from media-staging (%s)', (key) => {
+		expect(isStagingKey(key, 'img.afxengine.com')).toBe(true);
+	});
+
+	it.each([
+		['afx-site/acme/media_01j8/logo.png', 'afx production'],
+		['jhb-site/acme/logo.png', 'jhb production'],
+		['clients/example/cover.jpg', 'a key outside the CMS'],
+		['acme/afx-site-staging/logo.png', 'a tier name past the first segment'],
+		['afx-site-staging', 'a bare object named like a tier'],
+		['afx-site-stagingx/acme/logo.png', 'a segment that only starts like a tier'],
+	])('reads %s from media (%s)', (key) => {
+		expect(isStagingKey(key, 'img.afxengine.com')).toBe(false);
+	});
+
+	it('reads every img.arroweffect.com key from media, whatever its shape', () => {
+		expect(isStagingKey('clients/example/cover.jpg', 'img.arroweffect.com')).toBe(false);
+		expect(isStagingKey('afx-site-staging/acme/logo.png', 'img.arroweffect.com')).toBe(false);
+	});
+});
+
+describe('upload and delete by tier', () => {
+	const headers = () => ({ Authorization: `Bearer ${env.IMG_API_SECRET}`, 'Content-Type': 'application/json' });
+	const upload = (host, path) =>
+		workerFetch(
+			new Request(`https://${host}/upload`, {
+				method: 'POST',
+				headers: headers(),
+				body: JSON.stringify({ path, contentType: 'image/png', fileBase64: btoa('png') }),
+			}),
+		);
+	const remove = (host, path) =>
+		workerFetch(new Request(`https://${host}/delete`, { method: 'POST', headers: headers(), body: JSON.stringify({ path }) }));
+
+	it('writes a staging key to media-staging only', async () => {
+		const path = 'afx-site-staging/acme/media_1/logo.png';
+		expect((await upload('img.afxengine.com', path)).status).toBe(201);
+		expect(await env.MEDIA_STAGING_BUCKET.head(path)).not.toBeNull();
+		expect(await env.MEDIA_BUCKET.head(path)).toBeNull();
+	});
+
+	it('writes a production key to media only', async () => {
+		const path = 'afx-site/acme/media_2/logo.png';
+		expect((await upload('img.afxengine.com', path)).status).toBe(201);
+		expect(await env.MEDIA_BUCKET.head(path)).not.toBeNull();
+		expect(await env.MEDIA_STAGING_BUCKET.head(path)).toBeNull();
+	});
+
+	it('writes every img.arroweffect.com upload to media', async () => {
+		const path = 'afx-site-staging/client/cover.jpg';
+		expect((await upload('img.arroweffect.com', path)).status).toBe(201);
+		expect(await env.MEDIA_BUCKET.head(path)).not.toBeNull();
+		expect(await env.MEDIA_STAGING_BUCKET.head(path)).toBeNull();
+	});
+
+	it('deletes a staging key from media-staging and never touches media', async () => {
+		const path = 'afx-site-preview/acme/media_3/logo.png';
+		await env.MEDIA_STAGING_BUCKET.put(path, 'staging');
+		await env.MEDIA_BUCKET.put(path, 'production');
+		expect((await remove('img.afxengine.com', path)).status).toBe(200);
+		expect(await env.MEDIA_STAGING_BUCKET.head(path)).toBeNull();
+		expect(await env.MEDIA_BUCKET.head(path)).not.toBeNull();
+	});
+
+	it('answers 404 for a staging key that exists only in media', async () => {
+		const path = 'afx-site-staging/acme/media_4/logo.png';
+		await env.MEDIA_BUCKET.put(path, 'production');
+		expect((await remove('img.afxengine.com', path)).status).toBe(404);
+	});
+});
+
+describe('serving by tier', () => {
+	beforeAll(() => {
+		fetchMock.activate();
+		fetchMock.disableNetConnect();
+	});
+	afterEach(() => fetchMock.assertNoPendingInterceptors());
+	afterAll(() => fetchMock.deactivate());
+
+	const origin = (base, path) =>
+		fetchMock
+			.get(base)
+			.intercept({ path })
+			.reply(200, 'bytes', { headers: { 'Content-Type': 'image/svg+xml' } });
+
+	it('fetches a staging key from the media-staging origin', async () => {
+		origin(env.CDN_STAGING_ORIGIN, '/afx-site-staging/acme/logo.svg');
+		const response = await workerFetch(new Request('https://img.afxengine.com/afx-site-staging/acme/logo.svg'));
+		expect(response.status).toBe(200);
+	});
+
+	it('fetches a production key from the media origin', async () => {
+		origin(env.CDN_ORIGIN, '/afx-site/acme/logo.svg');
+		const response = await workerFetch(new Request('https://img.afxengine.com/afx-site/acme/logo.svg'));
+		expect(response.status).toBe(200);
+	});
+
+	it('fetches every img.arroweffect.com key from the media origin', async () => {
+		origin(env.CDN_ORIGIN, '/clients/example/cover.svg');
+		const response = await workerFetch(new Request('https://img.arroweffect.com/clients/example/cover.svg'));
+		expect(response.status).toBe(200);
+	});
+
+	it('fetches a raster from the tier origin through the transform', async () => {
+		origin(env.CDN_STAGING_ORIGIN, '/jhb-site-preview/acme/photo.jpg');
+		const response = await workerFetch(new Request('https://img.afxengine.com/jhb-site-preview/acme/photo.jpg?width=200'));
+		expect(response.status).toBe(200);
 	});
 });

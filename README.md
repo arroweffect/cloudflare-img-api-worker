@@ -2,14 +2,29 @@
 
 A Cloudflare Worker for managing and serving images via R2 storage and Cloudflare Image Transformations.
 
-**Public hostname:** `img.afxengine.com`.
-**Image origin (R2 custom domain):** `cdn.afxengine.com`.
+**Public hostnames:** `img.afxengine.com`, `img.arroweffect.com`.
+**Image origins (R2 custom domains):** `cdn.afxengine.com` (bucket `media`), `cdn-staging.afxengine.com` (bucket `media-staging`).
 
 - Upload, delete, and purge images via authenticated API endpoints
 - Serve and transform images on-the-fly (resize, format negotiation, quality)
 - SVG passthrough (served directly without transformation)
 - Automatic fallback to origin if image transformation fails
 - Error responses are never cached; only successful responses get long-lived cache headers
+
+---
+
+## Buckets
+
+Every read, upload and delete picks its bucket from the key's first path segment:
+
+| Key | Bucket | Origin |
+| --- | --- | --- |
+| First segment ends in `-staging`, `-preview` or `-sandbox` (`afx-site-staging/…`, `jhb-site-preview/…`) | `media-staging` | `CDN_STAGING_ORIGIN` |
+| Anything else (`afx-site/…`, `clients/…`) | `media` | `CDN_ORIGIN` |
+| Any key requested on `img.arroweffect.com` | `media` | `CDN_ORIGIN` |
+
+The AFX CMS writes production to `media` and every other tier to `media-staging`; URLs are the same
+`img.afxengine.com/<key>` for all of them. `/purge` purges a URL and touches no bucket.
 
 ---
 
@@ -137,7 +152,7 @@ There are two distinct tokens involved, with different roles:
 - **`IMG_API_SECRET`** — gates inbound requests to this worker. Callers must send it as a Bearer token on `POST /upload`, `/delete`, and `/purge`. `GET` requests for serving images do not require auth.
 - **`CF_PURGE_TOKEN`** — used outbound, only by `/purge`, to authenticate the worker to Cloudflare's REST API when calling `/zones/:zone_id/purge_cache`. Mint it as a Cloudflare API token scoped to **Zone → Cache Purge** on the relevant zone.
 
-Uploads and deletes do **not** need a Cloudflare API token — they use the R2 binding (`MEDIA_BUCKET`), which is authenticated implicitly by the worker's deployment identity.
+Uploads and deletes do **not** need a Cloudflare API token — they use the R2 bindings (`MEDIA_BUCKET`, `MEDIA_STAGING_BUCKET`), which are authenticated implicitly by the worker's deployment identity.
 
 Inbound bearer header for the protected endpoints:
 
@@ -154,8 +169,10 @@ Authorization: Bearer <IMG_API_SECRET>
 | `IMG_API_SECRET` | Secret  | Bearer token callers send to authenticate against `/upload`, `/delete`, `/purge`         |
 | `CF_PURGE_TOKEN` | Secret  | Cloudflare API token (Zone → Cache Purge) used by `/purge` to call the Cloudflare API    |
 | `ZONE_ID`        | Secret  | Cloudflare Zone ID the purge call targets                                                |
-| `CDN_ORIGIN`     | Var     | Base URL the worker fetches images from (R2 custom domain)                               |
-| `MEDIA_BUCKET`   | Binding | R2 bucket binding — used for upload/delete; no separate token needed                     |
+| `CDN_ORIGIN`     | Var     | Base URL the worker fetches `media` images from (R2 custom domain)                       |
+| `CDN_STAGING_ORIGIN` | Var | Base URL the worker fetches `media-staging` images from (R2 custom domain)               |
+| `MEDIA_BUCKET`   | Binding | R2 bucket `media` — used for upload/delete; no separate token needed                     |
+| `MEDIA_STAGING_BUCKET` | Binding | R2 bucket `media-staging` — used for upload/delete of non-production keys          |
 
 Secrets are set via `wrangler secret put <NAME>`. Plain vars and the R2 bucket binding are declared in `wrangler.jsonc`.
 
@@ -231,6 +248,7 @@ pnpm test -- run  # Single run
 - Auth — missing, invalid, and malformed tokens
 - Upload/delete validation — path rejection, missing fields
 - Cache headers — errors return `no-store`, not long-lived cache
+- Bucket routing — each tier's keys read, upload and delete against their own bucket and origin; `img.arroweffect.com` always uses `media`
 
 ---
 

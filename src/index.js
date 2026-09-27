@@ -22,6 +22,40 @@ export default {
 	},
 };
 
+/** The host whose keys all live in the production bucket, whatever their shape. */
+const PRODUCTION_ONLY_HOST = 'img.arroweffect.com';
+
+/** A first key segment naming a non-production tier: `afx-site-staging`, `jhb-site-preview`, … */
+const NON_PRODUCTION_SEGMENT = /-(staging|preview|sandbox)$/;
+
+/**
+ * Whether a key belongs in `media-staging`. Every non-production tier of the
+ * CMS writes there under `<brand>-<tier>/…`; production writes `media` under
+ * `<brand>/…`, and so does everything else this worker serves.
+ * @param {string} key - Object key, with or without a leading slash
+ * @param {string} [host] - Request hostname
+ * @returns {boolean}
+ */
+export function isStagingKey(key, host) {
+	if (host === PRODUCTION_ONLY_HOST) return false;
+	const segments = key.replace(/^\/+/, '').split('/');
+	return segments.length > 1 && NON_PRODUCTION_SEGMENT.test(segments[0]);
+}
+
+/**
+ * The bucket and origin that hold `key`.
+ * @param {string} key
+ * @param {Request} request
+ * @param {Record<string, any>} env
+ * @returns {{ bucket: R2Bucket, origin: string }}
+ */
+export function mediaLocation(key, request, env) {
+	const host = new URL(request.url).hostname;
+	return isStagingKey(key, host)
+		? { bucket: env.MEDIA_STAGING_BUCKET, origin: env.CDN_STAGING_ORIGIN }
+		: { bucket: env.MEDIA_BUCKET, origin: env.CDN_ORIGIN };
+}
+
 /**
  * Validates that a storage path is safe to use with R2.
  * Rejects empty paths, directory traversal, leading slashes, and control characters.
@@ -85,7 +119,7 @@ async function handleUpload(request, env) {
 
 	const buffer = Uint8Array.from(atob(fileBase64), (c) => c.charCodeAt(0));
 
-	await env.MEDIA_BUCKET.put(path, buffer, {
+	await mediaLocation(path, request, env).bucket.put(path, buffer, {
 		httpMetadata: {
 			contentType,
 			cacheControl: 'public, max-age=31536000',
@@ -147,7 +181,8 @@ async function handleDelete(request, env) {
 		);
 	}
 
-	const object = await env.MEDIA_BUCKET.head(path);
+	const { bucket } = mediaLocation(path, request, env);
+	const object = await bucket.head(path);
 	if (!object) {
 		return new Response(
 			JSON.stringify({
@@ -158,7 +193,7 @@ async function handleDelete(request, env) {
 		);
 	}
 
-	await env.MEDIA_BUCKET.delete(path);
+	await bucket.delete(path);
 
 	return new Response(
 		JSON.stringify({
@@ -242,7 +277,7 @@ async function handleFetchAndTransform(request, env) {
 	const url = new URL(request.url);
 	const path = url.pathname;
 	const searchParams = url.searchParams;
-	const imageURL = `${env.CDN_ORIGIN}${path}`;
+	const imageURL = `${mediaLocation(path, request, env).origin}${path}`;
 	const isSvg = path.endsWith('.svg');
 
 	// Step 1: Fetch the image (SVG = plain fetch, everything else = cf.image with fallback)
