@@ -51,6 +51,10 @@ export function isStagingKey(key, host) {
  */
 export function mediaLocation(key, request, env) {
 	const host = new URL(request.url).hostname;
+	// cf.image only transforms an origin on the requesting zone; a cross-zone
+	// origin comes back untransformed, with no error. So each host reads its
+	// bucket through a custom domain on its own zone.
+	if (host === PRODUCTION_ONLY_HOST) return { bucket: env.MEDIA_BUCKET, origin: env.ARROWEFFECT_ORIGIN };
 	return isStagingKey(key, host)
 		? { bucket: env.MEDIA_STAGING_BUCKET, origin: env.CDN_STAGING_ORIGIN }
 		: { bucket: env.MEDIA_BUCKET, origin: env.CDN_ORIGIN };

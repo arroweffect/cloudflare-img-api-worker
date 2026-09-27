@@ -292,9 +292,21 @@ describe('serving by tier', () => {
 		expect(response.status).toBe(200);
 	});
 
-	it('fetches every img.arroweffect.com key from the media origin', async () => {
-		origin(env.CDN_ORIGIN, '/clients/example/cover.svg');
+	it('fetches every img.arroweffect.com key from the arroweffect.com origin', async () => {
+		origin(env.ARROWEFFECT_ORIGIN, '/clients/example/cover.svg');
 		const response = await workerFetch(new Request('https://img.arroweffect.com/clients/example/cover.svg'));
+		expect(response.status).toBe(200);
+	});
+
+	it('transforms an img.arroweffect.com raster from its own zone', async () => {
+		origin(env.ARROWEFFECT_ORIGIN, '/web/collage/photo.jpg');
+		const response = await workerFetch(new Request('https://img.arroweffect.com/web/collage/photo.jpg?width=60'));
+		expect(response.status).toBe(200);
+	});
+
+	it('keeps a staging-shaped key on img.arroweffect.com on its own origin', async () => {
+		origin(env.ARROWEFFECT_ORIGIN, '/afx-site-staging/acme/logo.svg');
+		const response = await workerFetch(new Request('https://img.arroweffect.com/afx-site-staging/acme/logo.svg'));
 		expect(response.status).toBe(200);
 	});
 

@@ -21,7 +21,7 @@ Every read, upload and delete picks its bucket from the key's first path segment
 | --- | --- | --- |
 | First segment ends in `-staging`, `-preview` or `-sandbox` (`afx-site-staging/…`, `jhb-site-preview/…`) | `media-staging` | `CDN_STAGING_ORIGIN` |
 | Anything else (`afx-site/…`, `clients/…`) | `media` | `CDN_ORIGIN` |
-| Any key requested on `img.arroweffect.com` | `media` | `CDN_ORIGIN` |
+| Any key requested on `img.arroweffect.com` | `media` | `ARROWEFFECT_ORIGIN` |
 
 The AFX CMS writes production to `media` and every other tier to `media-staging`; URLs are the same
 `img.afxengine.com/<key>` for all of them. `/purge` purges a URL and touches no bucket.
@@ -171,6 +171,7 @@ Authorization: Bearer <IMG_API_SECRET>
 | `ZONE_ID`        | Secret  | Cloudflare Zone ID the purge call targets                                                |
 | `CDN_ORIGIN`     | Var     | Base URL the worker fetches `media` images from (R2 custom domain)                       |
 | `CDN_STAGING_ORIGIN` | Var | Base URL the worker fetches `media-staging` images from (R2 custom domain)               |
+| `ARROWEFFECT_ORIGIN` | Var | `media` through a custom domain on the arroweffect.com zone. Transforms only run on an origin in the requesting zone; a cross-zone origin is returned untransformed. |
 | `MEDIA_BUCKET`   | Binding | R2 bucket `media` — used for upload/delete; no separate token needed                     |
 | `MEDIA_STAGING_BUCKET` | Binding | R2 bucket `media-staging` — used for upload/delete of non-production keys          |
 

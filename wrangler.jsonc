@@ -49,7 +49,11 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
 	// The custom domains of `media` and `media-staging`.
-	"vars": { "CDN_ORIGIN": "https://cdn.afxengine.com", "CDN_STAGING_ORIGIN": "https://cdn-staging.afxengine.com" },
+	"vars": {
+		"CDN_ORIGIN": "https://cdn.afxengine.com",
+		"CDN_STAGING_ORIGIN": "https://cdn-staging.afxengine.com",
+		"ARROWEFFECT_ORIGIN": "https://media.arroweffect.com",
+	},
 	// "vars": { "MY_VARIABLE": "production_value" },
 	/**
 	 * Note: Use secrets to store sensitive data.
