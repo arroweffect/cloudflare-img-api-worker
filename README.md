@@ -85,13 +85,13 @@ Content-Type: application/json
 }
 ```
 
-Returns 404 if the file does not exist. Path validation is the same as upload.
+Returns 404 if the file does not exist. Path validation is the same as upload. The key is marked deleted before its variants are purged (see `/tombstone`).
 
 ---
 
 ### `POST /purge`
 
-Drops the cached variants of one or more image URLs, or of whole tenants, from the worker's cache, for objects removed behind the worker's back (a bucket-side delete, a tenant purge). `/delete` purges on its own. Zone-level purges never reach a Worker's cache, so this is the only way in.
+Drops the cached variants of one or more image URLs, or of whole tenants, from the worker's cache, and nothing else: the next request re-transforms. For a deleted object use `/tombstone`, which also keeps it from being re-cached. Zone-level purges never reach a Worker's cache, so this is the only way in.
 
 **Headers:**
 
@@ -119,6 +119,20 @@ Every response is tagged `key:<object key>`, and a `<base>/<slug>/…` response 
   "purgedTenants": []
 }
 ```
+
+---
+
+### `POST /tombstone`
+
+For objects the caller removed from the bucket itself: marks each object key, and each tenant, deleted in the `DELETED` KV namespace for 30 days, then purges their tags. A purge alone does not keep a deleted object gone: the transform layer's own cache of past results, which nothing here can purge, re-served variants of a deleted object for minutes, and a variant cut then is cached for a year.
+
+```json
+{ "keys": ["afx-site/acme/media_01m3…/photo.jpg"], "tenants": ["afx-site-staging/acme"] }
+```
+
+A tenant is `<base>/<slug>`, because slugs repeat across envs. A marked tenant refuses only media minted before the mark (the media id's TypeID timestamp), so a slug taken again after a purge serves its new media. At most 30 keys and tenants per call; safe to repeat. Response as `/purge`, with `tombstoned` and `tombstonedTenants`.
+
+Every cache miss checks the markers beside the transform, not before it, and answers `404` `no-store` when either matches (an `image_deleted` log line). Hits never reach the check. A KV failure fails open. A new marker can take up to a minute to reach every location, which is why the CMS calls this twice, the second time two minutes later.
 
 ---
 
@@ -150,7 +164,7 @@ GET /clients/example/cover.jpg?width=800&quality=80
 
 ## Authentication
 
-- **`IMG_API_SECRET`** — gates inbound requests to this worker. Callers must send it as a Bearer token on `POST /upload`, `/delete`, and `/purge`. `GET` requests for serving images do not require auth.
+- **`IMG_API_SECRET`** — gates inbound requests to this worker. Callers must send it as a Bearer token on `POST /upload`, `/delete`, `/purge`, and `/tombstone`. `GET` requests for serving images do not require auth.
 Uploads, deletes and purges need no Cloudflare API token — they use the R2 bindings (`MEDIA_BUCKET`, `MEDIA_STAGING_BUCKET`) and the worker's own cache, which are authenticated implicitly by the worker's deployment identity.
 
 Inbound bearer header for the protected endpoints:
@@ -165,12 +179,13 @@ Authorization: Bearer <IMG_API_SECRET>
 
 | Variable         | Type    | Purpose                                                                                  |
 | ---------------- | ------- | ---------------------------------------------------------------------------------------- |
-| `IMG_API_SECRET` | Secret  | Bearer token callers send to authenticate against `/upload`, `/delete`, `/purge`         |
+| `IMG_API_SECRET` | Secret  | Bearer token callers send to authenticate against `/upload`, `/delete`, `/purge`, `/tombstone` |
 | `CDN_ORIGIN`     | Var     | Base URL the worker fetches `media` images from (R2 custom domain)                       |
 | `CDN_STAGING_ORIGIN` | Var | Base URL the worker fetches `media-staging` images from (R2 custom domain)               |
 | `ARROWEFFECT_ORIGIN` | Var | `media` through a custom domain on the arroweffect.com zone. Transforms only run on an origin in the requesting zone; a cross-zone origin is returned untransformed. |
 | `MEDIA_BUCKET`   | Binding | R2 bucket `media` — used for upload/delete; no separate token needed                     |
 | `MEDIA_STAGING_BUCKET` | Binding | R2 bucket `media-staging` — used for upload/delete of non-production keys          |
+| `DELETED`        | Binding | KV namespace of deleted markers (`key:<key>`, `tenant:<base>/<slug>`), written by `/delete` and `/tombstone`, read on every miss |
 
 Secrets are set via `wrangler secret put <NAME>`. Plain vars and the R2 bucket binding are declared in `wrangler.jsonc`.
 

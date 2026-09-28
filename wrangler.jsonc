@@ -34,6 +34,14 @@
 			"bucket_name": "media-staging",
 		},
 	],
+	// Deleted markers (src/index.js `markDeleted`): a miss checks them, because
+	// the transform layer can re-serve a variant of an object already gone.
+	"kv_namespaces": [
+		{
+			"binding": "DELETED",
+			"id": "e88ce5096d554a798a83c8eee0546769",
+		},
+	],
 	"routes": [
 		{
 			"pattern": "img.arroweffect.com/*",

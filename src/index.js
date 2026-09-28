@@ -23,6 +23,8 @@ export default {
 			return handlePurge(request, env, ctx);
 		} else if (pathname === '/delete' && method === 'POST') {
 			return handleDelete(request, env, ctx);
+		} else if (pathname === '/tombstone' && method === 'POST') {
+			return handleTombstone(request, env, ctx);
 		} else {
 			return serveImage(request, ctx);
 		}
@@ -35,8 +37,17 @@ export default {
  * survives deploys (`cross_version_cache`) because a key's bytes never change.
  */
 export class Transform extends WorkerEntrypoint {
-	fetch(request) {
-		return handleFetchAndTransform(request, this.env);
+	/**
+	 * The deleted check runs beside the transform, not before it, so a live
+	 * object's miss waits for nothing it did not already wait for.
+	 */
+	async fetch(request) {
+		const path = new URL(request.url).pathname;
+		const [response, deleted] = await Promise.all([handleFetchAndTransform(request, this.env), isDeleted(path, this.env)]);
+		if (!deleted) return response;
+		await response.body?.cancel();
+		console.log(JSON.stringify({ level: 'info', type: 'image_deleted', path, colo: request.cf?.colo }));
+		return new Response('Image not found', { status: 404, headers: { 'Cache-Control': 'no-store' } });
 	}
 
 	/**
@@ -75,6 +86,75 @@ function keyTag(key) {
 
 function tenantTag(slug) {
 	return `tenant:${slug}`;
+}
+
+/**
+ * How long a deleted marker outlives the purge. The transform layer's own
+ * cache of past results, which nothing here can purge, re-served a deleted
+ * object's variants for minutes; a month is far past that, and a key is never
+ * reused, so an object marker never outlives anything live.
+ */
+const DELETED_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * Marks objects and tenants deleted, before their tags are purged, so a miss
+ * that lands after the purge cannot cache a fresh variant for a year. A tenant
+ * is its env-scoped prefix `<base>/<slug>`: slugs repeat across envs.
+ * @param {Record<string, any>} env
+ * @param {{ keys?: string[], tenants?: string[] }} what - object keys; tenant prefixes
+ */
+export async function markDeleted(env, { keys = [], tenants = [] }) {
+	const at = String(Date.now());
+	const options = { expirationTtl: DELETED_TTL_SECONDS };
+	await Promise.all([
+		...keys.map((key) => env.DELETED.put(`key:${key}`, at, options)),
+		...tenants.map((prefix) => env.DELETED.put(`tenant:${prefix}`, at, options)),
+	]);
+}
+
+/**
+ * Whether a read names a deleted object: its key is marked, or its tenant was
+ * purged before its media id was minted. The mint time decides because a
+ * purged tenant's slug can be taken again (fixtures are recreated right after
+ * a purge), and the new tenant's media must serve.
+ * @param {string} pathname - `/<key>`
+ * @param {Record<string, any>} env
+ * @returns {Promise<boolean>}
+ */
+export async function isDeleted(pathname, env) {
+	const key = pathname.replace(/^\/+/, '');
+	const segments = key.split('/');
+	const tenant = segments.length >= 4 ? `${segments[0]}/${segments[1]}` : null;
+	try {
+		const [object, tenantDeletedAt] = await Promise.all([
+			env.DELETED.get(`key:${key}`),
+			tenant ? env.DELETED.get(`tenant:${tenant}`) : null,
+		]);
+		if (object !== null) return true;
+		if (tenantDeletedAt === null) return false;
+		const minted = typeIdTime(segments[2]);
+		return minted === null || minted <= Number(tenantDeletedAt);
+	} catch (err) {
+		// Open, not closed: a KV outage must not take down every uncached image.
+		console.error(`deleted check failed for ${key}:`, err);
+		return false;
+	}
+}
+
+const CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz';
+
+/**
+ * The mint time of a prefixed TypeID (`media_01m3…`): its first ten suffix
+ * characters are the UUIDv7's 48-bit millisecond timestamp.
+ * @param {string} id
+ * @returns {number | null} epoch ms; null when `id` is not a TypeID
+ */
+export function typeIdTime(id) {
+	const suffix = id?.split('_').pop();
+	if (!suffix || !/^[0-7][0-9a-hjkmnp-tv-z]{25}$/.test(suffix)) return null;
+	let ms = 0;
+	for (const char of suffix.slice(0, 10)) ms = ms * 32 + CROCKFORD.indexOf(char);
+	return ms;
 }
 
 /**
@@ -310,6 +390,7 @@ async function handleDelete(request, env, ctx) {
 
 	await bucket.delete(path);
 	// The cache outlives the object: without this its variants serve for a year.
+	await markDeleted(env, { keys: [path] });
 	const purge = await ctx.exports.Transform.purge({ keys: [path] });
 
 	return new Response(
@@ -371,6 +452,54 @@ async function handlePurge(request, env, ctx) {
 
 	const result = await ctx.exports.Transform.purge({ keys, tenants });
 	return json({ ...result, purged: keys, purgedTenants: tenants }, result.success ? 200 : 502);
+}
+
+/** A tenant as the CMS names it here: `<env base>/<slug>`. */
+const TENANT_PREFIX = /^[a-z0-9-]+\/[a-z0-9-]+$/;
+
+/**
+ * Objects (`keys`) and tenants (`tenants`, as `<base>/<slug>`) the CMS removed
+ * from the bucket itself: marks each deleted, then purges its tags. Unlike
+ * `/purge`, which only empties the cache, a marked object stays unservable,
+ * so this is for deletes only. Safe to repeat.
+ * @param {Request} request
+ * @param {Record<string, any>} env
+ * @param {ExecutionContext} ctx
+ * @returns {Promise<Response>}
+ */
+async function handleTombstone(request, env, ctx) {
+	if (!isAuthorized(request, env)) {
+		return new Response('Unauthorized', { status: 401 });
+	}
+
+	let body;
+	try {
+		body = await request.json();
+	} catch {
+		return new Response('Invalid JSON body', { status: 400 });
+	}
+
+	const keys = body.keys ?? [];
+	const tenants = body.tenants ?? [];
+	if (!Array.isArray(keys) || !Array.isArray(tenants) || keys.length + tenants.length === 0) {
+		return new Response('Missing `keys` or `tenants` in body', { status: 400 });
+	}
+	if (keys.length + tenants.length > MAX_PURGE_TAGS) {
+		return new Response(`At most ${MAX_PURGE_TAGS} keys and tenants per request`, { status: 400 });
+	}
+	if (!keys.every(isValidPath)) {
+		return new Response('Invalid `keys` entry', { status: 400 });
+	}
+	if (tenants.some((prefix) => typeof prefix !== 'string' || !TENANT_PREFIX.test(prefix))) {
+		return new Response('Invalid `tenants` entry: expected `<base>/<slug>`', { status: 400 });
+	}
+
+	await markDeleted(env, { keys, tenants });
+	const result = await ctx.exports.Transform.purge({ keys, tenants: tenants.map((prefix) => prefix.split('/')[1]) });
+	return new Response(JSON.stringify({ ...result, tombstoned: keys, tombstonedTenants: tenants }), {
+		status: result.success ? 200 : 502,
+		headers: { 'Content-Type': 'application/json' },
+	});
 }
 
 /**

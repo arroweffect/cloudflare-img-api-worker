@@ -1,6 +1,6 @@
 import { env, createExecutionContext, fetchMock, waitOnExecutionContext } from 'cloudflare:test';
 import { afterAll, afterEach, beforeAll, describe, it, expect } from 'vitest';
-import worker, { isStagingKey, isValidPath, negotiatedFormat, transformCacheKey, cacheTagsFor } from '../src';
+import worker, { isStagingKey, isValidPath, negotiatedFormat, transformCacheKey, cacheTagsFor, typeIdTime, isDeleted } from '../src';
 
 // Helper to call worker.fetch with a context
 async function workerFetch(request, workerEnv = env) {
@@ -476,5 +476,107 @@ describe('purge validation', () => {
 		expect(body.purged).toEqual(['afx-site/acme/media_1/photo.jpg']);
 		expect(typeof body.success).toBe('boolean');
 		expect([200, 502]).toContain(response.status);
+	});
+});
+
+describe('deleted markers', () => {
+	const CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz';
+	// A media id minted at `ms`: the timestamp's ten characters, then zeros.
+	const mediaId = (ms) => {
+		let time = '';
+		for (let rest = ms, i = 0; i < 10; i++, rest = Math.floor(rest / 32)) time = CROCKFORD[rest % 32] + time;
+		return `media_${time}${'0'.repeat(16)}`;
+	};
+	const headers = () => ({ Authorization: `Bearer ${env.IMG_API_SECRET}`, 'Content-Type': 'application/json' });
+	const tombstone = (body) =>
+		workerFetch(new Request('https://img.afxengine.com/tombstone', { method: 'POST', headers: headers(), body: JSON.stringify(body) }));
+
+	it('reads the mint time of a media id', () => {
+		expect(typeIdTime('media_01m3mv9y9se2x9v2d4qt8x4a1c')).toBe(Date.parse('2026-09-28T20:29:06.745Z'));
+		expect(typeIdTime(mediaId(1_700_000_000_000))).toBe(1_700_000_000_000);
+	});
+
+	it.each([['logo.png'], ['media_short'], ['media_81m3mv9y9se2x9v2d4qt8x4a1c'], ['media_01m3mv9y9se2x9v2d4qt8x4a1u'], [undefined]])(
+		'reads no mint time from %s',
+		(id) => {
+			expect(typeIdTime(id)).toBeNull();
+		},
+	);
+
+	it('requires auth to tombstone', async () => {
+		const response = await workerFetch(new Request('https://img.afxengine.com/tombstone', { method: 'POST', body: '{}' }));
+		expect(response.status).toBe(401);
+	});
+
+	it.each([
+		[{}],
+		[{ keys: ['/leading.png'] }],
+		[{ tenants: ['acme'] }],
+		[{ tenants: ['afx-site/../x'] }],
+		[{ keys: Array.from({ length: 31 }, (_, i) => `a/${i}.jpg`) }],
+	])('refuses %j', async (body) => {
+		expect((await tombstone(body)).status).toBe(400);
+	});
+
+	it('marks an object deleted and answers with what it tombstoned', async () => {
+		const key = 'afx-site-staging/acme/media_1/photo.jpg';
+		const response = await tombstone({ keys: [key] });
+		const body = await response.json();
+		expect(body.tombstoned).toEqual([key]);
+		expect([200, 502]).toContain(response.status);
+		expect(await isDeleted(`/${key}`, env)).toBe(true);
+		expect(await isDeleted('/afx-site-staging/acme/media_2/photo.jpg', env)).toBe(false);
+	});
+
+	it('marks a tenant deleted in its env only, and only media minted before the purge', async () => {
+		const before = mediaId(Date.now() - 60_000);
+		const after = mediaId(Date.now() + 60_000);
+		expect((await tombstone({ tenants: ['afx-site-staging/acme'] })).status).not.toBe(400);
+		expect(await isDeleted(`/afx-site-staging/acme/${before}/photo.jpg`, env)).toBe(true);
+		expect(await isDeleted(`/afx-site-staging/acme/${before}/tok/photo.jpg`, env)).toBe(true);
+		expect(await isDeleted(`/afx-site-staging/acme/${after}/photo.jpg`, env)).toBe(false);
+		expect(await isDeleted(`/afx-site/acme/${before}/photo.jpg`, env)).toBe(false);
+		expect(await isDeleted('/afx-site-staging/acme/not-a-typeid/photo.jpg', env)).toBe(true);
+	});
+
+	it('marks the key /delete removes', async () => {
+		const path = 'afx-site-staging/acme/media_5/logo.png';
+		await env.MEDIA_STAGING_BUCKET.put(path, 'bytes');
+		const response = await workerFetch(
+			new Request('https://img.afxengine.com/delete', { method: 'POST', headers: headers(), body: JSON.stringify({ path }) }),
+		);
+		expect(response.status).toBe(200);
+		expect(await isDeleted(`/${path}`, env)).toBe(true);
+	});
+
+	describe('serving', () => {
+		beforeAll(() => {
+			fetchMock.activate();
+			fetchMock.disableNetConnect();
+		});
+		afterEach(() => fetchMock.assertNoPendingInterceptors());
+		afterAll(() => fetchMock.deactivate());
+
+		const path = '/afx-site/acme/media_9/photo.jpg';
+		const transformed = () =>
+			fetchMock
+				.get(env.CDN_ORIGIN)
+				.intercept({ path })
+				.reply(200, 'bytes', { headers: { 'Content-Type': 'image/avif', 'cf-resized': 'internal=ram/m' } });
+
+		it('refuses a variant the transform layer still cuts from a deleted object', async () => {
+			await tombstone({ keys: [path.slice(1)] });
+			transformed();
+			const response = await workerFetch(new Request(`https://img.afxengine.com${path}?width=64`, { headers: { Accept: 'image/avif,*/*' } }));
+			expect(response.status).toBe(404);
+			expect(response.headers.get('Cache-Control')).toBe('no-store');
+		});
+
+		it('serves a live object as before', async () => {
+			transformed();
+			const response = await workerFetch(new Request(`https://img.afxengine.com${path}?width=64`, { headers: { Accept: 'image/avif,*/*' } }));
+			expect(response.status).toBe(200);
+			expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+		});
 	});
 });
