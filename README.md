@@ -136,10 +136,11 @@ GET /clients/example/cover.jpg?width=800&quality=80
 
 **Cache behavior:**
 
-- Successful responses: `Cache-Control: public, max-age=31536000, stale-while-revalidate=86400`
+- Transformed responses (`cf-resized: internal=…`): `Cache-Control: public, max-age=31536000, stale-while-revalidate=86400`
+- Untransformed originals: `Cache-Control: public, max-age=60` plus `X-Img-Untransformed: <reason>` (for example `429 err=9422` when the transformation quota is exhausted, or `no cf-resized header` when transformations are not enabled on the zone), and a `image_untransformed` log line
 - 404 and error responses: `Cache-Control: no-store`
 
-**Fallback:** If Cloudflare image transformation fails, the worker retries by fetching the original untransformed image from the origin.
+**Fallback:** If Cloudflare image transformation fails, the worker retries by fetching the original untransformed image from the origin. The short cache on that response means a fixed zone or quota takes effect within a minute; probe with `curl -sI '<url>?width=64' | grep -i -e cf-resized -e x-img-untransformed`.
 
 **SVGs:** Served directly without transformation.
 

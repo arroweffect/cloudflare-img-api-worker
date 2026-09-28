@@ -286,6 +286,8 @@ async function handleFetchAndTransform(request, env) {
 
 	// Step 1: Fetch the image (SVG = plain fetch, everything else = cf.image with fallback)
 	let response;
+	// Why the bytes are the original rather than a transform; null when transformed.
+	let untransformed = null;
 
 	if (isSvg) {
 		try {
@@ -333,13 +335,23 @@ async function handleFetchAndTransform(request, env) {
 			response = await fetch(imageRequest, { cf: { image: imageOptions } });
 		} catch (err) {
 			console.error(`cf.image fetch threw for ${imageURL}:`, err);
+			untransformed = `threw ${err?.message ?? err}`;
 			response = null;
 		}
 
-		// Fallback: if transformation failed or returned a non-OK/non-404, fetch the original untransformed image
+		// A transform answers 2xx with `cf-resized: internal=…`. A 2xx without it is
+		// the original passed through (transforms disabled on the zone, or an origin
+		// off the zone), which used to be cached for a year and hid the gap for months.
+		if (response?.ok) {
+			const resized = response.headers.get('cf-resized') || '';
+			if (!resized.startsWith('internal=')) untransformed = resized || 'no cf-resized header';
+		}
+
+		// Fallback: a non-OK, non-404 transform (quota err=9422, bad parameters, 5xx) serves the original from the origin
 		if (!response || (!response.ok && response.status !== 404)) {
 			if (response) {
-				console.error(`cf.image returned ${response.status} for ${imageURL}, falling back to origin`);
+				untransformed = `${response.status} ${response.headers.get('cf-resized') || ''}`.trim();
+				console.error(`cf.image returned ${untransformed} for ${imageURL}, falling back to origin`);
 			}
 			try {
 				response = await fetch(imageURL, {
@@ -415,7 +427,27 @@ async function handleFetchAndTransform(request, env) {
 
 	// Step 3: Success — cache and return
 	const headers = new Headers(response.headers);
-	headers.set('Cache-Control', 'public, max-age=31536000, stale-while-revalidate=86400');
+	if (untransformed) {
+		// Short-lived so a fixed zone or quota takes effect within a minute, and
+		// named on the response so a probe sees the cause.
+		const reason = untransformed.replace(/[\r\n]+/g, ' ').slice(0, 200);
+		console.log(
+			JSON.stringify({
+				level: 'warn',
+				type: 'image_untransformed',
+				path: path,
+				origin: imageURL,
+				reason,
+				status: response.status,
+				colo: request.cf?.colo,
+				ray: request.headers.get('cf-ray'),
+			}),
+		);
+		headers.set('Cache-Control', 'public, max-age=60');
+		headers.set('X-Img-Untransformed', reason);
+	} else {
+		headers.set('Cache-Control', 'public, max-age=31536000, stale-while-revalidate=86400');
+	}
 	if (isSvg) {
 		headers.set('Content-Type', 'image/svg+xml');
 	}

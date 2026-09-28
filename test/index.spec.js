@@ -316,3 +316,53 @@ describe('serving by tier', () => {
 		expect(response.status).toBe(200);
 	});
 });
+
+describe('untransformed originals', () => {
+	beforeAll(() => {
+		fetchMock.activate();
+		fetchMock.disableNetConnect();
+	});
+	afterEach(() => fetchMock.assertNoPendingInterceptors());
+	afterAll(() => fetchMock.deactivate());
+
+	const path = '/afx-site/acme/media_1/photo.jpg';
+	const url = `https://img.afxengine.com${path}?width=64`;
+	const reply = (status, headers = {}) =>
+		fetchMock
+			.get(env.CDN_ORIGIN)
+			.intercept({ path })
+			.reply(status, 'bytes', { headers: { 'Content-Type': 'image/jpeg', ...headers } });
+
+	it('caches a transform for a year', async () => {
+		reply(200, { 'cf-resized': 'internal=ok/m q=0 n=346+0' });
+		const response = await workerFetch(new Request(url));
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, stale-while-revalidate=86400');
+		expect(response.headers.get('X-Img-Untransformed')).toBeNull();
+	});
+
+	it('caches a passed-through original for a minute and names the cause', async () => {
+		reply(200);
+		const response = await workerFetch(new Request(url));
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Cache-Control')).toBe('public, max-age=60');
+		expect(response.headers.get('X-Img-Untransformed')).toBe('no cf-resized header');
+	});
+
+	it('names the transform error when the origin fallback serves the original', async () => {
+		reply(429, { 'cf-resized': 'err=9422' });
+		reply(200);
+		const response = await workerFetch(new Request(url));
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Cache-Control')).toBe('public, max-age=60');
+		expect(response.headers.get('X-Img-Untransformed')).toBe('429 err=9422');
+	});
+
+	it('never caches when the origin fallback fails too', async () => {
+		reply(500, { 'cf-resized': 'err=9520' });
+		reply(502);
+		const response = await workerFetch(new Request(url));
+		expect(response.status).toBe(502);
+		expect(response.headers.get('Cache-Control')).toBe('no-store');
+	});
+});
