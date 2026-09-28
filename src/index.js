@@ -40,32 +40,37 @@ export class Transform extends WorkerEntrypoint {
 	}
 
 	/**
-	 * Drops every cached format of each object path, and every entry tagged for
-	 * each tenant. Scoped to this entrypoint by the runtime, which is why the
+	 * Drops every cached variant of each object and every entry of each tenant,
+	 * by tag: a path prefix does not match an entry stored under a custom
+	 * `cf.cacheKey`. Scoped to this entrypoint by the runtime, which is why the
 	 * gateway cannot purge on its own.
-	 * @param {{ pathnames?: string[], tenants?: string[] }} what - `/<key>` paths; tenant slugs
+	 * @param {{ keys?: string[], tenants?: string[] }} what - object keys (no leading slash); tenant slugs
 	 * @returns {Promise<{ success: boolean, errors?: { code: number, message: string }[] }>}
 	 */
-	async purge({ pathnames = [], tenants = [] }) {
+	async purge({ keys = [], tenants = [] }) {
 		const cache = this.ctx.cache;
 		if (!cache?.purge) return { success: false, errors: [{ code: 0, message: 'cache purge is unavailable in this runtime' }] };
-		const what = {};
-		if (pathnames.length) what.pathPrefixes = pathnames.flatMap(purgePrefixesFor);
-		if (tenants.length) what.tags = tenants.map(tenantTag);
-		return cache.purge(what);
+		return cache.purge({ tags: [...keys.map(keyTag), ...tenants.map(tenantTag)] });
 	}
 }
 
 /**
- * The cache tag of a tenant key: `<base>/<slug>/<media id>/…` is one tenant's
- * media, so one tag purge retires a tenant's every variant. Shorter keys
- * (platform assets) carry no tag.
+ * The tags of a cached response: its object key always, and its tenant when
+ * the key is `<base>/<slug>/<media id>/…`, so one tag purge retires either an
+ * object's every variant or a tenant's every entry.
  * @param {string} pathname - `/<key>`
- * @returns {string | null}
+ * @returns {string[]}
  */
-export function tenantTagFor(pathname) {
-	const segments = pathname.replace(/^\/+/, '').split('/');
-	return segments.length >= 4 ? tenantTag(segments[1]) : null;
+export function cacheTagsFor(pathname) {
+	const key = pathname.replace(/^\/+/, '');
+	const segments = key.split('/');
+	const tags = [keyTag(key)];
+	if (segments.length >= 4) tags.push(tenantTag(segments[1]));
+	return tags;
+}
+
+function keyTag(key) {
+	return `key:${key}`;
 }
 
 function tenantTag(slug) {
@@ -78,9 +83,6 @@ function tenantTag(slug) {
  * retires every entry the previous behaviour wrote, atomically with the deploy.
  */
 const CACHE_KEY_VERSION = 'v1';
-
-/** The formats one URL can be answered in, each the leading segment of its cache key. */
-const FORMATS = ['avif', 'webp', 'jpeg', 'asked', 'svg'];
 
 /**
  * The format a request will be answered in, decided as `handleFetchAndTransform`
@@ -103,23 +105,13 @@ export function negotiatedFormat(request) {
 /**
  * The `Transform` cache key: the key version, the negotiated format, then the
  * path and query as requested. The format leads the path so no query string
- * can spell another format's entry, and a purge by path prefix covers every
- * format of one key.
+ * can spell another format's entry.
  * @param {Request} request
  * @returns {string}
  */
 export function transformCacheKey(request) {
 	const url = new URL(request.url);
 	return `/${CACHE_KEY_VERSION}/${negotiatedFormat(request)}${url.pathname}${url.search}`;
-}
-
-/**
- * The cache path prefixes that cover every cached variant of one object path.
- * @param {string} pathname - `/<key>`
- * @returns {string[]}
- */
-export function purgePrefixesFor(pathname) {
-	return FORMATS.map((format) => `/${CACHE_KEY_VERSION}/${format}${pathname}`);
 }
 
 /**
@@ -318,7 +310,7 @@ async function handleDelete(request, env, ctx) {
 
 	await bucket.delete(path);
 	// The cache outlives the object: without this its variants serve for a year.
-	const purge = await ctx.exports.Transform.purge({ pathnames: [`/${path}`] });
+	const purge = await ctx.exports.Transform.purge({ keys: [path] });
 
 	return new Response(
 		JSON.stringify({
@@ -331,8 +323,8 @@ async function handleDelete(request, env, ctx) {
 	);
 }
 
-/** Path-prefix purges take at most 100 prefixes; each path expands to one per format. */
-const MAX_PURGE_PATHS = Math.floor(100 / FORMATS.length);
+/** A tag purge takes at most 30 tags per call. */
+const MAX_PURGE_TAGS = 30;
 
 /**
  * Drops the cached variants of the given image URLs (`url` or `urls`), or of
@@ -362,23 +354,23 @@ async function handlePurge(request, env, ctx) {
 	if (!Array.isArray(urls) || !Array.isArray(tenants) || urls.length + tenants.length === 0) {
 		return new Response('Missing `url`, `urls` or `tenants` in body', { status: 400 });
 	}
-	if (urls.length > MAX_PURGE_PATHS) {
-		return new Response(`At most ${MAX_PURGE_PATHS} urls per request`, { status: 400 });
+	if (urls.length + tenants.length > MAX_PURGE_TAGS) {
+		return new Response(`At most ${MAX_PURGE_TAGS} urls and tenants per request`, { status: 400 });
 	}
 	if (tenants.some((slug) => typeof slug !== 'string' || !/^[a-z0-9-]+$/.test(slug))) {
 		return new Response('Invalid `tenants` entry', { status: 400 });
 	}
-	const pathnames = [];
+	const keys = [];
 	for (const target of urls) {
 		try {
-			pathnames.push(new URL(target).pathname);
+			keys.push(new URL(target).pathname.replace(/^\/+/, ''));
 		} catch {
 			return new Response('Invalid `url` field', { status: 400 });
 		}
 	}
 
-	const result = await ctx.exports.Transform.purge({ pathnames, tenants });
-	return json({ ...result, purged: pathnames, purgedTenants: tenants }, result.success ? 200 : 502);
+	const result = await ctx.exports.Transform.purge({ keys, tenants });
+	return json({ ...result, purged: keys, purgedTenants: tenants }, result.success ? 200 : 502);
 }
 
 /**
@@ -558,8 +550,7 @@ async function handleFetchAndTransform(request, env) {
 	} else {
 		// A key is written once and never reused, so its bytes are fixed for life.
 		headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-		const tag = tenantTagFor(path);
-		if (tag) headers.set('Cache-Tag', tag);
+		headers.set('Cache-Tag', cacheTagsFor(path).join(','));
 	}
 	if (isSvg) {
 		headers.set('Content-Type', 'image/svg+xml');

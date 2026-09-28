@@ -1,6 +1,6 @@
 import { env, createExecutionContext, fetchMock, waitOnExecutionContext } from 'cloudflare:test';
 import { afterAll, afterEach, beforeAll, describe, it, expect } from 'vitest';
-import worker, { isStagingKey, isValidPath, negotiatedFormat, transformCacheKey, purgePrefixesFor, tenantTagFor } from '../src';
+import worker, { isStagingKey, isValidPath, negotiatedFormat, transformCacheKey, cacheTagsFor } from '../src';
 
 // Helper to call worker.fetch with a context
 async function workerFetch(request, workerEnv = env) {
@@ -342,7 +342,7 @@ describe('untransformed originals', () => {
 		const response = await workerFetch(new Request(url));
 		expect(response.status).toBe(200);
 		expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
-		expect(response.headers.get('Cache-Tag')).toBe('tenant:acme');
+		expect(response.headers.get('Cache-Tag')).toBe('key:afx-site/acme/media_1/photo.jpg,tenant:acme');
 		expect(response.headers.get('X-Img-Untransformed')).toBeNull();
 	});
 
@@ -394,16 +394,12 @@ describe('transform cache key', () => {
 	});
 
 	it.each([
-		['/afx-site/acme/media_1/photo.jpg', 'tenant:acme'],
-		['/afx-site-staging/acme/media_1/tok/photo.jpg', 'tenant:acme'],
-		['/clients/example/cover.jpg', null],
-		['/web/ae-og-image.png', null],
-	])('tags %s as %s', (pathname, tag) => {
-		expect(tenantTagFor(pathname)).toBe(tag);
-	});
-
-	it('names every format of one path for a purge', () => {
-		expect(purgePrefixesFor('/a/b/c.jpg')).toEqual(['/v1/avif/a/b/c.jpg', '/v1/webp/a/b/c.jpg', '/v1/jpeg/a/b/c.jpg', '/v1/asked/a/b/c.jpg', '/v1/svg/a/b/c.jpg']);
+		['/afx-site/acme/media_1/photo.jpg', ['key:afx-site/acme/media_1/photo.jpg', 'tenant:acme']],
+		['/afx-site-staging/acme/media_1/tok/photo.jpg', ['key:afx-site-staging/acme/media_1/tok/photo.jpg', 'tenant:acme']],
+		['/clients/example/cover.jpg', ['key:clients/example/cover.jpg']],
+		['/web/ae-og-image.png', ['key:web/ae-og-image.png']],
+	])('tags %s as %s', (pathname, tags) => {
+		expect(cacheTagsFor(pathname)).toEqual(tags);
 	});
 });
 
@@ -469,15 +465,15 @@ describe('purge validation', () => {
 		expect([200, 502]).toContain(response.status);
 	});
 
-	it('rejects more urls than one purge call can name', async () => {
-		const urls = Array.from({ length: 21 }, (_, i) => `https://img.afxengine.com/a/${i}.jpg`);
+	it('rejects more urls and tenants than one purge call can name', async () => {
+		const urls = Array.from({ length: 31 }, (_, i) => `https://img.afxengine.com/a/${i}.jpg`);
 		expect((await purge({ urls })).status).toBe(400);
 	});
 
 	it('answers with the paths it purged and the runtime result', async () => {
 		const response = await purge({ url: 'https://img.afxengine.com/afx-site/acme/media_1/photo.jpg?width=64' });
 		const body = await response.json();
-		expect(body.purged).toEqual(['/afx-site/acme/media_1/photo.jpg']);
+		expect(body.purged).toEqual(['afx-site/acme/media_1/photo.jpg']);
 		expect(typeof body.success).toBe('boolean');
 		expect([200, 502]).toContain(response.status);
 	});

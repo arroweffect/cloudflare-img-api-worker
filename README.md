@@ -108,14 +108,14 @@ Content-Type: application/json
 { "tenants": ["acme"] }
 ```
 
-At most 20 urls per call (each expands to one cache prefix per format); every query-string variant of a url is dropped. A tenant purge is one tag (`tenant:<slug>`, set on every `<base>/<slug>/…` response), whatever the tenant's size. `urls` and `tenants` combine.
+Every response is tagged `key:<object key>`, and a `<base>/<slug>/…` response `tenant:<slug>` as well, so a url purge drops every format and query-string variant of that object and a tenant purge is one tag whatever the tenant's size. At most 30 urls and tenants per call. `urls` and `tenants` combine.
 
 **Response:** `200` when the runtime accepted the purge, `502` with `errors` when it refused (rate limit)
 
 ```json
 {
   "success": true,
-  "purged": ["/clients/example/cover.jpg"],
+  "purged": ["clients/example/cover.jpg"],
   "purgedTenants": []
 }
 ```
@@ -138,7 +138,7 @@ GET /clients/example/cover.jpg?width=800&quality=80
 
 **Cache behavior:** the worker owns its cache ([Workers Cache](https://developers.cloudflare.com/workers/cache/)). The uncached gateway (`default` export) normalises `Accept` into a key, `/<CACHE_KEY_VERSION>/<avif|webp|jpeg|asked|svg>/<path>?<query>`, and calls the cached `Transform` entrypoint under it, so one entry serves every browser that negotiates the same format. Entries are tiered (edge, then an upper tier) and survive deploys (`cross_version_cache`): a key's bytes never change, and a change to the transform's output is rolled out by bumping `CACHE_KEY_VERSION` in `src/index.js`, which retires every older entry atomically with the deploy. The headers below decide what is stored:
 
-- Transformed responses (`cf-resized: internal=…`): `Cache-Control: public, max-age=31536000, immutable` (a key is written once and never reused) and `Cache-Tag: tenant:<slug>` on tenant keys
+- Transformed responses (`cf-resized: internal=…`): `Cache-Control: public, max-age=31536000, immutable` (a key is written once and never reused) and `Cache-Tag: key:<object key>[,tenant:<slug>]`
 - Untransformed originals: `Cache-Control: public, max-age=60` plus `X-Img-Untransformed: <reason>` (for example `429 err=9422` when the transformation quota is exhausted, or `no cf-resized header` when transformations are not enabled on the zone), and a `image_untransformed` log line
 - 404 and error responses: `Cache-Control: no-store`
 
