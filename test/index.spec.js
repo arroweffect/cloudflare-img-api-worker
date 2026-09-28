@@ -1,6 +1,6 @@
 import { env, createExecutionContext, fetchMock, waitOnExecutionContext } from 'cloudflare:test';
 import { afterAll, afterEach, beforeAll, describe, it, expect } from 'vitest';
-import worker, { isStagingKey, isValidPath } from '../src';
+import worker, { isStagingKey, isValidPath, negotiatedFormat, transformCacheKey, purgePrefixesFor, tenantTagFor } from '../src';
 
 // Helper to call worker.fetch with a context
 async function workerFetch(request, workerEnv = env) {
@@ -250,11 +250,15 @@ describe('upload and delete by tier', () => {
 		expect(await env.MEDIA_STAGING_BUCKET.head(path)).toBeNull();
 	});
 
-	it('deletes a staging key from media-staging and never touches media', async () => {
+	it('deletes a staging key from media-staging, never touches media, and purges its variants', async () => {
 		const path = 'afx-site-preview/acme/media_3/logo.png';
 		await env.MEDIA_STAGING_BUCKET.put(path, 'staging');
 		await env.MEDIA_BUCKET.put(path, 'production');
-		expect((await remove('img.afxengine.com', path)).status).toBe(200);
+		const response = await remove('img.afxengine.com', path);
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.deleted).toBe(path);
+		expect(typeof body.purged).toBe('boolean');
 		expect(await env.MEDIA_STAGING_BUCKET.head(path)).toBeNull();
 		expect(await env.MEDIA_BUCKET.head(path)).not.toBeNull();
 	});
@@ -333,11 +337,12 @@ describe('untransformed originals', () => {
 			.intercept({ path })
 			.reply(status, 'bytes', { headers: { 'Content-Type': 'image/jpeg', ...headers } });
 
-	it('caches a transform for a year', async () => {
+	it('caches a transform for a year, immutable, tagged by tenant', async () => {
 		reply(200, { 'cf-resized': 'internal=ok/m q=0 n=346+0' });
 		const response = await workerFetch(new Request(url));
 		expect(response.status).toBe(200);
-		expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, stale-while-revalidate=86400');
+		expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+		expect(response.headers.get('Cache-Tag')).toBe('tenant:acme');
 		expect(response.headers.get('X-Img-Untransformed')).toBeNull();
 	});
 
@@ -364,5 +369,116 @@ describe('untransformed originals', () => {
 		const response = await workerFetch(new Request(url));
 		expect(response.status).toBe(502);
 		expect(response.headers.get('Cache-Control')).toBe('no-store');
+	});
+});
+
+describe('transform cache key', () => {
+	const req = (url, accept) => new Request(url, { headers: accept ? { Accept: accept } : {} });
+	const avif = 'image/avif,image/webp,image/*,*/*;q=0.8';
+
+	it.each([
+		['https://img.afxengine.com/a/b/c.jpg?width=64', avif, 'avif'],
+		['https://img.afxengine.com/a/b/c.jpg?width=64', 'image/webp,*/*', 'webp'],
+		['https://img.afxengine.com/a/b/c.jpg?width=64', 'image/*', 'jpeg'],
+		['https://img.afxengine.com/a/b/c.jpg?width=64', null, 'jpeg'],
+		['https://img.afxengine.com/a/b/c.jpg?width=64&format=auto', avif, 'avif'],
+		['https://img.afxengine.com/a/b/c.jpg?width=64&format=png', avif, 'asked'],
+		['https://img.afxengine.com/a/b/logo.svg', avif, 'svg'],
+	])('%s with Accept %s is %s', (url, accept, format) => {
+		expect(negotiatedFormat(req(url, accept))).toBe(format);
+	});
+
+	it('leads with the format, then the path and query as requested', () => {
+		expect(transformCacheKey(req('https://img.afxengine.com/a/b/c.jpg?width=64&quality=80', avif))).toBe('/v1/avif/a/b/c.jpg?width=64&quality=80');
+		expect(transformCacheKey(req('https://img.afxengine.com/a/b/c.jpg', 'image/*'))).toBe('/v1/jpeg/a/b/c.jpg');
+	});
+
+	it.each([
+		['/afx-site/acme/media_1/photo.jpg', 'tenant:acme'],
+		['/afx-site-staging/acme/media_1/tok/photo.jpg', 'tenant:acme'],
+		['/clients/example/cover.jpg', null],
+		['/web/ae-og-image.png', null],
+	])('tags %s as %s', (pathname, tag) => {
+		expect(tenantTagFor(pathname)).toBe(tag);
+	});
+
+	it('names every format of one path for a purge', () => {
+		expect(purgePrefixesFor('/a/b/c.jpg')).toEqual(['/v1/avif/a/b/c.jpg', '/v1/webp/a/b/c.jpg', '/v1/jpeg/a/b/c.jpg', '/v1/asked/a/b/c.jpg', '/v1/svg/a/b/c.jpg']);
+	});
+});
+
+describe('gateway', () => {
+	beforeAll(() => {
+		fetchMock.activate();
+		fetchMock.disableNetConnect();
+	});
+	afterEach(() => fetchMock.assertNoPendingInterceptors());
+	afterAll(() => fetchMock.deactivate());
+
+	const path = '/afx-site/acme/media_2/photo.jpg';
+	const reply = (headers = {}) =>
+		fetchMock
+			.get(env.CDN_ORIGIN)
+			.intercept({ path })
+			.reply(200, 'bytes', { headers: { 'Content-Type': 'image/avif', 'cf-resized': 'internal=ok/m', ...headers } });
+
+	it('marks a negotiated answer as varying by Accept', async () => {
+		reply();
+		const response = await workerFetch(new Request(`https://img.afxengine.com${path}?width=64`, { headers: { Accept: 'image/avif,*/*' } }));
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Vary')).toBe('Accept');
+	});
+
+	it('does not vary an explicitly requested format', async () => {
+		reply();
+		const response = await workerFetch(new Request(`https://img.afxengine.com${path}?width=64&format=png`, { headers: { Accept: 'image/avif,*/*' } }));
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Vary')).toBeNull();
+	});
+
+	it('serves the Transform entrypoint directly', async () => {
+		reply();
+		const ctx = createExecutionContext();
+		const response = await ctx.exports.Transform.fetch(new Request(`https://img.afxengine.com${path}?width=64`, { headers: { Accept: 'image/avif,*/*' } }));
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Vary')).toBeNull();
+	});
+});
+
+describe('purge validation', () => {
+	const headers = () => ({ Authorization: `Bearer ${env.IMG_API_SECRET}`, 'Content-Type': 'application/json' });
+	const purge = (body) => workerFetch(new Request('https://img.afxengine.com/purge', { method: 'POST', headers: headers(), body: JSON.stringify(body) }));
+
+	it('rejects a body naming nothing', async () => {
+		expect((await purge({})).status).toBe(400);
+	});
+
+	it('rejects an invalid url', async () => {
+		expect((await purge({ url: 'not a url' })).status).toBe(400);
+	});
+
+	it('rejects a tenant slug that is not one', async () => {
+		expect((await purge({ tenants: ['../x'] })).status).toBe(400);
+	});
+
+	it('purges a tenant by tag', async () => {
+		const response = await purge({ tenants: ['acme'] });
+		const body = await response.json();
+		expect(body.purgedTenants).toEqual(['acme']);
+		expect([200, 502]).toContain(response.status);
+	});
+
+	it('rejects more urls than one purge call can name', async () => {
+		const urls = Array.from({ length: 21 }, (_, i) => `https://img.afxengine.com/a/${i}.jpg`);
+		expect((await purge({ urls })).status).toBe(400);
+	});
+
+	it('answers with the paths it purged and the runtime result', async () => {
+		const response = await purge({ url: 'https://img.afxengine.com/afx-site/acme/media_1/photo.jpg?width=64' });
+		const body = await response.json();
+		expect(body.purged).toEqual(['/afx-site/acme/media_1/photo.jpg']);
+		expect(typeof body.success).toBe('boolean');
+		expect([200, 502]).toContain(response.status);
 	});
 });

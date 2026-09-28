@@ -6,9 +6,22 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "img-api-worker",
 	"main": "src/index.js",
-	"compatibility_date": "2025-06-05",
+	// ctx.exports (the gateway's loopback to `Transform`) is on from 2025-11-17.
+	"compatibility_date": "2026-07-06",
 	"observability": {
 		"enabled": true,
+	},
+	// Workers Cache in front of `Transform` only: the gateway runs on every
+	// request and computes the key (src/index.js `transformCacheKey`). The cache
+	// outlives deploys because a key's bytes never change; a change to the
+	// transform itself bumps CACHE_KEY_VERSION in src/index.js.
+	"cache": {
+		"enabled": true,
+		"cross_version_cache": true,
+	},
+	"exports": {
+		"default": { "type": "worker", "cache": { "enabled": false } },
+		"Transform": { "type": "worker", "cache": { "enabled": true } },
 	},
 	"r2_buckets": [
 		{

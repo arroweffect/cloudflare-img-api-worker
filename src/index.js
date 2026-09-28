@@ -1,11 +1,18 @@
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+/**
+ * The gateway: uncached (wrangler.jsonc `exports.default`), so it runs on every
+ * request. Admin routes are handled here; every other path is an image read,
+ * which it hands to the cached `Transform` entrypoint under a key it computes.
+ */
 export default {
 	/**
-	 * Entry point for the Worker. Routes requests to appropriate handler.
 	 * @param {Request} request - Incoming HTTP request
 	 * @param {Record<string, any>} env - Worker environment bindings
+	 * @param {ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const method = request.method;
 		const pathname = url.pathname;
@@ -13,14 +20,126 @@ export default {
 		if (pathname === '/upload' && method === 'POST') {
 			return handleUpload(request, env);
 		} else if (pathname === '/purge' && method === 'POST') {
-			return handlePurge(request, env);
+			return handlePurge(request, env, ctx);
 		} else if (pathname === '/delete' && method === 'POST') {
-			return handleDelete(request, env);
+			return handleDelete(request, env, ctx);
 		} else {
-			return handleFetchAndTransform(request, env);
+			return serveImage(request, ctx);
 		}
 	},
 };
+
+/**
+ * The cached entrypoint (wrangler.jsonc `exports.Transform`): Workers Cache
+ * sits in front of it, keyed by what the gateway passes as `cf.cacheKey`, and
+ * survives deploys (`cross_version_cache`) because a key's bytes never change.
+ */
+export class Transform extends WorkerEntrypoint {
+	fetch(request) {
+		return handleFetchAndTransform(request, this.env);
+	}
+
+	/**
+	 * Drops every cached format of each object path, and every entry tagged for
+	 * each tenant. Scoped to this entrypoint by the runtime, which is why the
+	 * gateway cannot purge on its own.
+	 * @param {{ pathnames?: string[], tenants?: string[] }} what - `/<key>` paths; tenant slugs
+	 * @returns {Promise<{ success: boolean, errors?: { code: number, message: string }[] }>}
+	 */
+	async purge({ pathnames = [], tenants = [] }) {
+		const cache = this.ctx.cache;
+		if (!cache?.purge) return { success: false, errors: [{ code: 0, message: 'cache purge is unavailable in this runtime' }] };
+		const what = {};
+		if (pathnames.length) what.pathPrefixes = pathnames.flatMap(purgePrefixesFor);
+		if (tenants.length) what.tags = tenants.map(tenantTag);
+		return cache.purge(what);
+	}
+}
+
+/**
+ * The cache tag of a tenant key: `<base>/<slug>/<media id>/…` is one tenant's
+ * media, so one tag purge retires a tenant's every variant. Shorter keys
+ * (platform assets) carry no tag.
+ * @param {string} pathname - `/<key>`
+ * @returns {string | null}
+ */
+export function tenantTagFor(pathname) {
+	const segments = pathname.replace(/^\/+/, '').split('/');
+	return segments.length >= 4 ? tenantTag(segments[1]) : null;
+}
+
+function tenantTag(slug) {
+	return `tenant:${slug}`;
+}
+
+/**
+ * Bump when the transform's output for an unchanged URL changes (option
+ * mapping, negotiation, headers): the cache outlives deploys, so this is what
+ * retires every entry the previous behaviour wrote, atomically with the deploy.
+ */
+const CACHE_KEY_VERSION = 'v1';
+
+/** The formats one URL can be answered in, each the leading segment of its cache key. */
+const FORMATS = ['avif', 'webp', 'jpeg', 'asked', 'svg'];
+
+/**
+ * The format a request will be answered in, decided as `handleFetchAndTransform`
+ * decides: an SVG is served as is, an explicit `format` other than `auto` wins,
+ * else `Accept` picks AVIF, then WebP, then JPEG.
+ * @param {Request} request
+ * @returns {'avif'|'webp'|'jpeg'|'asked'|'svg'}
+ */
+export function negotiatedFormat(request) {
+	const url = new URL(request.url);
+	if (url.pathname.endsWith('.svg')) return 'svg';
+	const asked = url.searchParams.get('format');
+	if (asked && asked !== 'auto') return 'asked';
+	const accept = request.headers.get('Accept') || '';
+	if (/image\/avif/.test(accept)) return 'avif';
+	if (/image\/webp/.test(accept)) return 'webp';
+	return 'jpeg';
+}
+
+/**
+ * The `Transform` cache key: the key version, the negotiated format, then the
+ * path and query as requested. The format leads the path so no query string
+ * can spell another format's entry, and a purge by path prefix covers every
+ * format of one key.
+ * @param {Request} request
+ * @returns {string}
+ */
+export function transformCacheKey(request) {
+	const url = new URL(request.url);
+	return `/${CACHE_KEY_VERSION}/${negotiatedFormat(request)}${url.pathname}${url.search}`;
+}
+
+/**
+ * The cache path prefixes that cover every cached variant of one object path.
+ * @param {string} pathname - `/<key>`
+ * @returns {string[]}
+ */
+export function purgePrefixesFor(pathname) {
+	return FORMATS.map((format) => `/${CACHE_KEY_VERSION}/${format}${pathname}`);
+}
+
+/**
+ * An image read: only `Accept` crosses into the cached entrypoint, and a
+ * negotiated answer is marked as varying by it on the way out (the cache
+ * never sees that `Vary`; the key already carries the format).
+ * @param {Request} request
+ * @param {ExecutionContext} ctx
+ * @returns {Promise<Response>}
+ */
+async function serveImage(request, ctx) {
+	const accept = request.headers.get('Accept');
+	const upstream = new Request(request.url, { method: request.method, headers: accept ? { Accept: accept } : {} });
+	const format = negotiatedFormat(request);
+	const response = await ctx.exports.Transform.fetch(upstream, { cf: { cacheKey: transformCacheKey(request) } });
+	if (!response.ok || format === 'asked' || format === 'svg') return response;
+	const headers = new Headers(response.headers);
+	headers.set('Vary', 'Accept');
+	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
 
 /** The host whose keys all live in the production bucket, whatever their shape. */
 const PRODUCTION_ONLY_HOST = 'img.arroweffect.com';
@@ -139,7 +258,7 @@ async function handleUpload(request, env) {
  * @param {Record<string, any>} env - Worker environment bindings
  * @returns {Promise<Response>}
  */
-async function handleDelete(request, env) {
+async function handleDelete(request, env, ctx) {
 	if (!isAuthorized(request, env)) {
 		return new Response(
 			JSON.stringify({
@@ -198,23 +317,33 @@ async function handleDelete(request, env) {
 	}
 
 	await bucket.delete(path);
+	// The cache outlives the object: without this its variants serve for a year.
+	const purge = await ctx.exports.Transform.purge({ pathnames: [`/${path}`] });
 
 	return new Response(
 		JSON.stringify({
 			success: true,
 			deleted: path,
+			purged: purge.success,
+			...(purge.success ? {} : { purgeErrors: purge.errors }),
 		}),
 		{ status: 200, headers: { 'Content-Type': 'application/json' } },
 	);
 }
 
+/** Path-prefix purges take at most 100 prefixes; each path expands to one per format. */
+const MAX_PURGE_PATHS = Math.floor(100 / FORMATS.length);
+
 /**
- * Handles purging Cloudflare cache for a specific file URL.
+ * Drops the cached variants of the given image URLs (`url` or `urls`), or of
+ * whole tenants (`tenants`), for objects removed behind this worker's back.
+ * Zone purges never reach a Worker's cache, so this is the only way in.
  * @param {Request} request - Incoming HTTP request
  * @param {Record<string, any>} env - Worker environment bindings
+ * @param {ExecutionContext} ctx
  * @returns {Promise<Response>}
  */
-async function handlePurge(request, env) {
+async function handlePurge(request, env, ctx) {
 	if (!isAuthorized(request, env)) {
 		return new Response('Unauthorized', { status: 401 });
 	}
@@ -226,49 +355,30 @@ async function handlePurge(request, env) {
 		return new Response('Invalid JSON body', { status: 400 });
 	}
 
-	const { url: targetUrlStr } = body;
+	const json = (payload, status) => new Response(JSON.stringify(payload), { status, headers: { 'Content-Type': 'application/json' } });
 
-	if (!targetUrlStr) {
-		return new Response('Missing `url` field in body', { status: 400 });
+	const urls = body.urls ?? (body.url ? [body.url] : []);
+	const tenants = body.tenants ?? [];
+	if (!Array.isArray(urls) || !Array.isArray(tenants) || urls.length + tenants.length === 0) {
+		return new Response('Missing `url`, `urls` or `tenants` in body', { status: 400 });
+	}
+	if (urls.length > MAX_PURGE_PATHS) {
+		return new Response(`At most ${MAX_PURGE_PATHS} urls per request`, { status: 400 });
+	}
+	if (tenants.some((slug) => typeof slug !== 'string' || !/^[a-z0-9-]+$/.test(slug))) {
+		return new Response('Invalid `tenants` entry', { status: 400 });
+	}
+	const pathnames = [];
+	for (const target of urls) {
+		try {
+			pathnames.push(new URL(target).pathname);
+		} catch {
+			return new Response('Invalid `url` field', { status: 400 });
+		}
 	}
 
-	let purgeTarget;
-	try {
-		const targetUrl = new URL(targetUrlStr);
-		purgeTarget = targetUrl.toString();
-	} catch {
-		return new Response('Invalid `url` field', { status: 400 });
-	}
-
-	const purgeRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${env.ZONE_ID}/purge_cache`, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${env.CF_PURGE_TOKEN}`,
-			'Content-Type': 'application/json',
-		},
-		body: JSON.stringify({
-			files: [purgeTarget],
-		}),
-	});
-
-	const data = await purgeRes.json();
-
-	if (!purgeRes.ok || !data.success) {
-		console.error('Purge error:', data.errors);
-		return new Response(`Failed to purge: ${JSON.stringify(data.errors)}`, { status: 500 });
-	}
-
-	return new Response(
-		JSON.stringify({
-			success: true,
-			purged: purgeTarget,
-			cloudflare: data,
-		}),
-		{
-			status: 200,
-			headers: { 'Content-Type': 'application/json' },
-		},
-	);
+	const result = await ctx.exports.Transform.purge({ pathnames, tenants });
+	return json({ ...result, purged: pathnames, purgedTenants: tenants }, result.success ? 200 : 502);
 }
 
 /**
@@ -446,7 +556,10 @@ async function handleFetchAndTransform(request, env) {
 		headers.set('Cache-Control', 'public, max-age=60');
 		headers.set('X-Img-Untransformed', reason);
 	} else {
-		headers.set('Cache-Control', 'public, max-age=31536000, stale-while-revalidate=86400');
+		// A key is written once and never reused, so its bytes are fixed for life.
+		headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+		const tag = tenantTagFor(path);
+		if (tag) headers.set('Cache-Tag', tag);
 	}
 	if (isSvg) {
 		headers.set('Content-Type', 'image/svg+xml');

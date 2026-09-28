@@ -91,7 +91,7 @@ Returns 404 if the file does not exist. Path validation is the same as upload.
 
 ### `POST /purge`
 
-Purges the Cloudflare CDN cache for a given image URL.
+Drops the cached variants of one or more image URLs, or of whole tenants, from the worker's cache, for objects removed behind the worker's back (a bucket-side delete, a tenant purge). `/delete` purges on its own. Zone-level purges never reach a Worker's cache, so this is the only way in.
 
 **Headers:**
 
@@ -100,21 +100,23 @@ Authorization: Bearer <your-secret-token>
 Content-Type: application/json
 ```
 
-**Body:**
+**Body:** one of
 
 ```json
-{
-	"url": "https://img.afxengine.com/clients/example/cover.jpg"
-}
+{ "url": "https://img.afxengine.com/clients/example/cover.jpg" }
+{ "urls": ["https://img.afxengine.com/clients/example/cover.jpg", "..."] }
+{ "tenants": ["acme"] }
 ```
 
-**Response:**
+At most 20 urls per call (each expands to one cache prefix per format); every query-string variant of a url is dropped. A tenant purge is one tag (`tenant:<slug>`, set on every `<base>/<slug>/…` response), whatever the tenant's size. `urls` and `tenants` combine.
+
+**Response:** `200` when the runtime accepted the purge, `502` with `errors` when it refused (rate limit)
 
 ```json
 {
   "success": true,
-  "purged": "https://img.afxengine.com/clients/example/cover.jpg",
-  "cloudflare": { ... }
+  "purged": ["/clients/example/cover.jpg"],
+  "purgedTenants": []
 }
 ```
 
@@ -134,9 +136,9 @@ Serves and transforms images on-the-fly using [Cloudflare Image Transformations]
 GET /clients/example/cover.jpg?width=800&quality=80
 ```
 
-**Cache behavior:**
+**Cache behavior:** the worker owns its cache ([Workers Cache](https://developers.cloudflare.com/workers/cache/)). The uncached gateway (`default` export) normalises `Accept` into a key, `/<CACHE_KEY_VERSION>/<avif|webp|jpeg|asked|svg>/<path>?<query>`, and calls the cached `Transform` entrypoint under it, so one entry serves every browser that negotiates the same format. Entries are tiered (edge, then an upper tier) and survive deploys (`cross_version_cache`): a key's bytes never change, and a change to the transform's output is rolled out by bumping `CACHE_KEY_VERSION` in `src/index.js`, which retires every older entry atomically with the deploy. The headers below decide what is stored:
 
-- Transformed responses (`cf-resized: internal=…`): `Cache-Control: public, max-age=31536000, stale-while-revalidate=86400`
+- Transformed responses (`cf-resized: internal=…`): `Cache-Control: public, max-age=31536000, immutable` (a key is written once and never reused) and `Cache-Tag: tenant:<slug>` on tenant keys
 - Untransformed originals: `Cache-Control: public, max-age=60` plus `X-Img-Untransformed: <reason>` (for example `429 err=9422` when the transformation quota is exhausted, or `no cf-resized header` when transformations are not enabled on the zone), and a `image_untransformed` log line
 - 404 and error responses: `Cache-Control: no-store`
 
@@ -148,12 +150,8 @@ GET /clients/example/cover.jpg?width=800&quality=80
 
 ## Authentication
 
-There are two distinct tokens involved, with different roles:
-
 - **`IMG_API_SECRET`** — gates inbound requests to this worker. Callers must send it as a Bearer token on `POST /upload`, `/delete`, and `/purge`. `GET` requests for serving images do not require auth.
-- **`CF_PURGE_TOKEN`** — used outbound, only by `/purge`, to authenticate the worker to Cloudflare's REST API when calling `/zones/:zone_id/purge_cache`. Mint it as a Cloudflare API token scoped to **Zone → Cache Purge** on the relevant zone.
-
-Uploads and deletes do **not** need a Cloudflare API token — they use the R2 bindings (`MEDIA_BUCKET`, `MEDIA_STAGING_BUCKET`), which are authenticated implicitly by the worker's deployment identity.
+Uploads, deletes and purges need no Cloudflare API token — they use the R2 bindings (`MEDIA_BUCKET`, `MEDIA_STAGING_BUCKET`) and the worker's own cache, which are authenticated implicitly by the worker's deployment identity.
 
 Inbound bearer header for the protected endpoints:
 
@@ -168,8 +166,6 @@ Authorization: Bearer <IMG_API_SECRET>
 | Variable         | Type    | Purpose                                                                                  |
 | ---------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `IMG_API_SECRET` | Secret  | Bearer token callers send to authenticate against `/upload`, `/delete`, `/purge`         |
-| `CF_PURGE_TOKEN` | Secret  | Cloudflare API token (Zone → Cache Purge) used by `/purge` to call the Cloudflare API    |
-| `ZONE_ID`        | Secret  | Cloudflare Zone ID the purge call targets                                                |
 | `CDN_ORIGIN`     | Var     | Base URL the worker fetches `media` images from (R2 custom domain)                       |
 | `CDN_STAGING_ORIGIN` | Var | Base URL the worker fetches `media-staging` images from (R2 custom domain)               |
 | `ARROWEFFECT_ORIGIN` | Var | `media` through a custom domain on the arroweffect.com zone. Transforms only run on an origin in the requesting zone; a cross-zone origin is returned untransformed. |

@@ -13,9 +13,9 @@
 	},
 	"type": "module",
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"@cloudflare/vitest-pool-workers": "^0.12.21",
 		"dotenv": "^16.5.0",
-		"vitest": "~3.0.7",
-		"wrangler": "^4.93.0"
+		"vitest": "~3.2.7",
+		"wrangler": "^4.136.3"
 	}
 }
