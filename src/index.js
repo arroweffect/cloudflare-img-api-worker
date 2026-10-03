@@ -207,9 +207,12 @@ async function serveImage(request, ctx) {
 	const upstream = new Request(request.url, { method: request.method, headers: accept ? { Accept: accept } : {} });
 	const format = negotiatedFormat(request);
 	const response = await ctx.exports.Transform.fetch(upstream, { cf: { cacheKey: transformCacheKey(request) } });
-	if (!response.ok || format === 'asked' || format === 'svg') return response;
 	const headers = new Headers(response.headers);
-	headers.set('Vary', 'Accept');
+	// Every image here is public, so a page's script may read what it can
+	// already display: a canvas, a size audit, a download. No credentials ride
+	// these requests, so the wildcard is the right form.
+	headers.set('Access-Control-Allow-Origin', '*');
+	if (response.ok && format !== 'asked' && format !== 'svg') headers.set('Vary', 'Accept');
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
